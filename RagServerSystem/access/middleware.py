@@ -1,4 +1,4 @@
-"""HTTP 中间件：滑动窗口限流 + Prometheus 请求指标。
+"""HTTP 中间件：request_id 贯穿 + 滑动窗口限流 + Prometheus 请求指标。
 
 单进程实现：限流桶按 key（X-API-KEY 或客户端 IP）各自维护最近一分钟的时间戳队列，
 多 worker 部署时需换成 Redis 计数才能全局生效。
@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 
 from config.settings import RATE_LIMIT_PER_MINUTE
 from utils.metrics import http_requests_total, http_request_duration_seconds
+from utils.request_context import clear_request_id, normalize_request_id, set_request_id
 
 # 监控端点放行：健康检查与指标抓取被限流会直接影响告警，不能计入配额
 _PASS_PATHS = ("/health", "/metrics")
@@ -62,4 +63,29 @@ def register_middleware(app, limiter: RateLimiter) -> None:
         http_request_duration_seconds.labels(
             request.method, request.url.path
         ).observe(elapsed)
+        return response
+
+
+def register_request_context_middleware(app) -> None:
+    """注册 request_id 贯穿中间件。
+
+    - 入口处确定 request_id：优先透传外部 X-Request-ID（便于网关/前端关联），
+      无效则生成 32 位十六进制新值；写入 contextvars，该请求内的所有
+      await 链路（含 SSE 生成器、create_task 衍生的历史落库任务）自动继承；
+    - 结束后在响应头回写 X-Request-ID，客户端可据其报障，服务端 grep 即得全链路日志；
+    - finally 中清理上下文，防止协程上下文泄漏到请求外的任务。
+
+    注册顺序说明：Starlette 后注册的中间件在更外层、先执行。
+    本中间件必须在 register_middleware（限流）之后注册，保证 429 限流响应也带 request_id。
+    """
+
+    @app.middleware("http")
+    async def request_context(request: Request, call_next):
+        request_id = normalize_request_id(request.headers.get("X-Request-ID", ""))
+        set_request_id(request_id)
+        try:
+            response = await call_next(request)
+        finally:
+            clear_request_id()
+        response.headers["X-Request-ID"] = request_id
         return response

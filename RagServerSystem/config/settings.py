@@ -175,6 +175,9 @@ CIRCUIT_HALF_OPEN_MAX_CALLS = 1  # 半开态允许的探测请求数（探测成
 
 # 日志配置统一在 logs/log_config.py（级别/轮转/输出目标），此处不再重复声明。
 # 该模块自带降级逻辑、可独立于 config 使用，故不反向依赖本文件。
+# 文件侧 JSON 结构化输出（每行一个 JSON 对象，含 request_id）；
+# 控制台始终为纯文本（含 request_id），便于开发阅读。False 可回退旧纯文本格式。
+LOG_FORMAT_JSON = True
 
 # Redis配置
 REDIS_CONFIG = {

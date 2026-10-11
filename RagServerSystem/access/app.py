@@ -24,7 +24,7 @@ from config.settings import API_HOST, API_PORT, RESPONSE_TIMEOUT
 from logs.log_config import log
 from utils.security import DataSecurity
 from agent.service import create_unified_agent
-from access.middleware import RateLimiter, register_middleware
+from access.middleware import RateLimiter, register_middleware, register_request_context_middleware
 from shared.schemas import AgentRequest, RAGRequest
 from access.routes.auth import require_user
 from service.cache import ResponseCache
@@ -210,8 +210,13 @@ class RAGService:
             return JSONResponse(checks, status_code=code)
 
     def _register_middleware(self):
-        """注册限流 + 请求计速中间件（实现见 access/middleware.py）。"""
-        register_middleware(self.app, self.rate_limiter)
+        """注册中间件（实现见 access/middleware.py）。
+
+        Starlette 后注册的在更外层、先执行：request_id 中间件放最后（最外层），
+        保证包括限流 429 在内的所有响应都带 X-Request-ID、所有日志都注入 request_id。
+        """
+        register_middleware(self.app, self.rate_limiter)          # 限流 + 请求计速（内层）
+        register_request_context_middleware(self.app)             # request_id 贯穿（外层）
 
     def run(self):
         log.info(f"启动RAG API服务：http://{API_HOST}:{API_PORT}")
