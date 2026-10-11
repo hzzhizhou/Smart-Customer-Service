@@ -1,0 +1,22 @@
+# Grafana 数据源自动装载：启动时注册 Prometheus，无需手工点选。
+#
+# 文件名不叫 prometheus.yml：编辑器 YAML 语言服务会按文件名把 prometheus.yml
+# 自动关联到 SchemaStore 的「Prometheus 服务端配置」schema（根节点 additionalProperties:false），
+# 从而把本文件的 apiVersion/datasources 判为非法属性而误报。Grafana 只看目录不看文件名。
+#
+# uid 固定为 prometheus：看板 JSON 里的面板直接按此 uid 引用数据源，
+# 换显示名（name）不会断链。若你的 Prometheus 不在 rag-prometheus:9090，
+# 只改下面的 url 即可（容器网络里用服务名，宿主机则填 host.docker.internal）。
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      # 与 Prometheus 的 scrape_interval 对齐，作为 $__rate_interval 的下限参考
+      timeInterval: 15s

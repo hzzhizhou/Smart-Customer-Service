@@ -7,7 +7,8 @@
 #   3. 首次启动 app 容器检测到向量库为空会自动入库（DashScope embedding，约 1-2 分钟），
 #      docker compose logs -f app 看到 "Uvicorn running" 即就绪
 #
-# 宿主机映射：API 8000；MySQL 暴露到宿主机 3307（避开本机已有 3306）。
+# 宿主机映射：API 8000；MySQL 暴露到宿主机 3307（避开本机已有 3306）；
+# 可观测栈 Prometheus 9090、Grafana 3000（看板见 deploy/observability/）。
 # 应用访问 MySQL/Redis 始终走容器内网络（服务名），与宿主机映射无关。
 services:
   mysql:
@@ -78,8 +79,43 @@ services:
     ports:
       - "8000:8000"
 
+  # 可观测栈：Prometheus 抓 app 的 /metrics，Grafana 自动装载看板（deploy/observability/）。
+  # 两个容器与 app 同在默认网络，故 prometheus.yml 里 target 直接写 app:8000。
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: rag-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./deploy/observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: rag-grafana
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    # 管理台口令：.env 里设 GRAFANA_PASSWORD；未设则默认 admin
+    environment:
+      TZ: Asia/Shanghai
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+    volumes:
+      # provisioning：数据源 + 看板目录自动装载；dashboards：看板 JSON（改完存盘即生效）
+      - ./deploy/observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+
 volumes:
   mysql-data:
   redis-data:
   vector-data:
   app-logs:
+  prometheus-data:
+  grafana-data:

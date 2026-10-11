@@ -1,0 +1,20 @@
+# Prometheus 抓取配置：抓后端 /metrics（FastAPI + prometheus_client 默认文本格式）。
+#
+# 目标地址随部署方式二选一（改 targets 即可）：
+#   - prometheus 与 app 同在 docker 网络 → app:8000
+#   - prometheus 跑在宿主机            → host.docker.internal:8000（或本机直接用 127.0.0.1:8000）
+#
+# 抓取间隔 15s / 保留 15 天（保留期在启动命令 --storage.tsdb.retention.time=15d 里设）。
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # job 名必须与看板里 up{job="rag-app"} 保持一致，改名要同步改看板
+  - job_name: rag-app
+    metrics_path: /metrics
+    static_configs:
+      # compose 部署时改回 "app:8000"；本地起后端验证时用 host.docker.internal:8000
+      - targets: ["host.docker.internal:8000"]
+        labels:
+          service: rag-agent

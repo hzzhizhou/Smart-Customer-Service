@@ -1,0 +1,19 @@
+# Grafana 看板自动装载：启动时把 dashboards 目录里的 JSON 扫进指定文件夹。
+#
+# 挂载方式（容器里）：
+#   ./deploy/observability/grafana/provisioning  → /etc/grafana/provisioning
+#   ./deploy/observability/grafana/dashboards    → /var/lib/grafana/dashboards
+apiVersion: 1
+
+providers:
+  - name: rag-dashboards
+    orgId: 1
+    folder: "智能售后客服"
+    type: file
+    disableDeletion: false
+    # 每 30s 重扫一次目录：改完 JSON 存盘即生效，无需重启 Grafana
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
