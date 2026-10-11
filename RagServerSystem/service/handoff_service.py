@@ -10,6 +10,7 @@ from logs.log_config import log
 from infrastructure import mysql_store
 from agent.tools.ticket_tool import create_ticket_record
 from shared.reply_templates import HANDOFF_OPENING
+from utils.metrics import handoff_total
 
 
 def _write_opening(ticket_id: str) -> Dict[str, Any]:
@@ -37,6 +38,8 @@ def ensure_handoff_session(user_id: str, question: str = "") -> Tuple[Dict[str, 
         category="consult",
     )
     _write_opening(ticket["ticket_id"])
+    # 只在「新建」时计数：复用既有会话不算一次新的转人工，否则命中率会被重复请求灌水
+    handoff_total.labels("user_request").inc()
     log.info(f"人工会话已开启：{ticket['ticket_id']} | 用户：{user_id}")
     return ticket, False
 

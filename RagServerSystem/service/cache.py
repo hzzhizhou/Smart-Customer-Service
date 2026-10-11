@@ -9,6 +9,7 @@ import time
 from typing import Dict, Optional, Tuple
 
 from config.settings import CACHE_MAXSIZE, CACHE_TTL
+from utils.metrics import cache_requests_total
 
 
 class ResponseCache:
@@ -32,13 +33,20 @@ class ResponseCache:
             self._store[key] = (time.time(), result)
 
     def get(self, key: str) -> Optional[dict]:
-        """读缓存；过期即删除并返回 None。"""
+        """读缓存；过期即删除并返回 None。命中/未命中计入指标用于算命中率。
+
+        过期视为未命中（它确实触发了一次真实检索），避免把「已失效但还没被淘汰」
+        的条目算成命中、虚高命中率。
+        """
         with self._lock:
             hit = self._store.get(key)
             if hit is None:
+                cache_requests_total.labels("response", "miss").inc()
                 return None
             ts, result = hit
             if time.time() - ts > self._ttl:
                 del self._store[key]
+                cache_requests_total.labels("response", "miss").inc()
                 return None
+            cache_requests_total.labels("response", "hit").inc()
             return result

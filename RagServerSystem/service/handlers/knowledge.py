@@ -14,6 +14,7 @@ from typing import AsyncIterator
 from logs.log_config import log
 from service.handlers.context import TurnContext
 from shared.constants import could_be_empty_answer, is_empty_answer
+from utils.metrics import agent_fallback_total
 from shared.reply_templates import (
     AGENT_NO_ANSWER_FALLBACK,
     KNOWLEDGE_NO_ANSWER,
@@ -43,6 +44,7 @@ async def stream_knowledge_answer(retrieval_service, answer_generator,
     )
     if gate_info.get("should_escalate") or not docs:
         log.info(f"知识兜底：检索置信度不足，转人工 | level={gate_info.get('level')}")
+        agent_fallback_total.labels("low_confidence").inc()
         yield KNOWLEDGE_NO_ANSWER.format(contact=SERVICE_CONTACT)
         return
     produced = False
@@ -63,10 +65,12 @@ async def stream_knowledge_answer(retrieval_service, answer_generator,
         # 整段收完仍没直通：是空答复 → 换兜底话术；否则（如「好的」这类短答）原样透出
         if is_empty_answer(pending):
             log.info(f"知识作答空答复改走兜底 | 问题={question[:40]}")
+            agent_fallback_total.labels("empty_answer").inc()
             yield KNOWLEDGE_NO_ANSWER.format(contact=SERVICE_CONTACT)
         else:
             yield pending
     elif not produced:
+        agent_fallback_total.labels("empty_answer").inc()
         yield KNOWLEDGE_NO_ANSWER.format(contact=SERVICE_CONTACT)
 
 

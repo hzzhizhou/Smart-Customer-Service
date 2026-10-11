@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime
 from langchain_core.tools import tool
 from logs.log_config import log
-from utils.metrics import tickets_created_total
+from utils.metrics import handoff_total, tickets_created_total
 from infrastructure.mysql_store import create_ticket as _persist_ticket
 from shared.reply_templates import SERVICE_CONTACT, TICKET_CREATED, sla_cn
 
@@ -96,6 +96,7 @@ def create_ticket(
     if ticket["category"] in _HANDOFF_CATEGORY:
         from service.handoff_service import start_handoff_session
         start_handoff_session(ticket["ticket_id"])
+        handoff_total.labels("agent_tool").inc()
     response_time = sla_cn(ticket["priority"])
     return TICKET_CREATED.format(
         ticket_id=ticket["ticket_id"],

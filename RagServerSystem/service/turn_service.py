@@ -12,7 +12,9 @@
 - RagTurnService  ：无状态检索问答，带响应缓存与门控响应头。
 """
 import asyncio
+import json
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -22,6 +24,15 @@ from langchain_core.messages import AIMessage, HumanMessage
 from config.settings import CHAT_HISTORY_WINDOW, DST_ENABLED
 from logs.log_config import log
 from utils.circuit_breaker import llm_breaker
+from utils.metrics import (
+    agent_duration_seconds,
+    agent_fallback_total,
+    agent_ttft_seconds,
+    agent_tool_calls_total,
+    agent_tool_duration_seconds,
+    branch_total,
+    intent_total,
+)
 from shared.schemas import RAGRequest
 from service.cache import ResponseCache
 from infrastructure.chat_history_factory import init_chat_history
@@ -52,6 +63,60 @@ from shared.reply_templates import (
 
 # 后台生成任务集合：持有引用防止任务被 GC 回收（生成与 HTTP 连接解耦后需独立跑完）
 _BG_TASKS: set = set()
+
+
+def _summarize_value(value: Any, limit: int = 200) -> str:
+    """把工具入参/输出压成单行摘要（观测用，防日志刷屏：检索文档全文不进日志）。
+
+    字符串原样折叠空白；dict/list 走 JSON；不可序列化对象经 default=str 兜底；
+    超长截断并加省略号标记。
+    """
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        except Exception:
+            text = str(value)
+    text = " ".join(text.split())
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
+class _TTFTRecorder:
+    """首 token 延迟记录器：一轮只记一次（TTFT 是流式体验的核心指标）。
+
+    起算点由调用方给出（Agent 取 start_turn 入口、RAG 取 stream 入口），
+    因此包含意图识别、历史加载、DST 等「用户实际在等」的前置耗时，而不只是模型时间。
+    """
+
+    def __init__(self, started_at: float, path: str):
+        self._started_at = started_at
+        self._path = path
+        self._done = False
+
+    def mark(self) -> None:
+        """首次调用时记一次耗时；后续调用直接返回（幂等）。"""
+        if self._done:
+            return
+        self._done = True
+        agent_ttft_seconds.labels(self._path).observe(
+            max(time.perf_counter() - self._started_at, 0.0))
+
+
+class _StreamQueue:
+    """产出侧队列包装：首次写入用户可见内容时记录 TTFT，其余行为与原生队列一致。
+
+    只包装生产者使用的 put；哨兵 None 由 _spawn_producer 用真实队列写入，
+    因此不会把「结束标记」误算成首 token。
+    """
+
+    def __init__(self, queue: asyncio.Queue, recorder: _TTFTRecorder):
+        self._queue = queue
+        self._recorder = recorder
+
+    async def put(self, item: Any) -> None:
+        self._recorder.mark()
+        await self._queue.put(item)
 
 
 def _spawn_producer(coro, queue: asyncio.Queue) -> None:
@@ -138,9 +203,12 @@ class AgentTurnService:
         生成与 HTTP 连接解耦：客户端中途断开时，Starlette 只会关掉下游生成器，
         上游生成不受影响，从而避免「半截答复被当成完整答复写进历史」。
         """
+        turn_started_at = time.perf_counter()   # TTFT 起算点（必须在 _prepare 之前）
         turn = await self._prepare(question, session_id, user)
         queue: asyncio.Queue = asyncio.Queue()
-        _spawn_producer(self._produce(turn, queue), queue)
+        # TTFT 起算于 start_turn 入口（含 _prepare 的意图识别/历史加载/DST 加载）
+        stream_q = _StreamQueue(queue, _TTFTRecorder(turn_started_at, "agent"))
+        _spawn_producer(self._produce(turn, stream_q), queue)
         return queue
 
     # ---------- 准备阶段 ----------
@@ -241,6 +309,9 @@ class AgentTurnService:
         elif intent_info["intent"] == "complaint":
             prompt += " 这是投诉场景，不要自行承诺赔偿，优先创建工单转人工。"
         log.info(f"意图识别 | {intent_info} | 问题={question[:40]}")
+        # 意图分布指标：与上面这行日志同点，回答「用户都在问什么」。
+        # intent 取值来自分类器固定集合，标签基数有界。
+        intent_total.labels(intent_info["intent"]).inc()
         # 若启用 DST 且存在跨轮状态：注入会话记忆 + 意图融合（保持业务主线）
         if dst is not None and DST_ENABLED:
             new_intent = intent_info["intent"]
@@ -291,6 +362,11 @@ class AgentTurnService:
         final_text: List[str] = []
         # 处理器只负责「这一轮回什么」，写历史与推进 DST 统一在这里收尾
         handler, dst_tool_count = self._pick_handler(turn.ctx)
+        # 分支分布指标：确定性分支取其处理器名（去掉 handle_ 前缀），
+        # 都不命中记为 agent（泛化 ReAct）。回答「请求实际走了哪条链路」。
+        branch_total.labels(
+            handler.__name__.removeprefix("handle_") if handler is not None else "agent"
+        ).inc()
         if handler is not None:
             try:
                 async for piece in handler(turn.ctx):
@@ -325,21 +401,46 @@ class AgentTurnService:
         pending = ""       # Final Answer 之后的正文缓冲（空答复判定用，见 _produce_rag）
         passthrough = False
         tool_calls_this_round = {"n": 0}   # 统计本轮工具调用（推进 EXECUTING 阶段）
+        tool_started: Dict[str, float] = {}  # run_id → 打点时刻（工具耗时观测）
+        reasoning_chars = 0                 # Final Answer 前的 Thought/Action 推理字数（观测用）
         # 熔断：LLM 连续失败时不再进入 ReAct 循环（否则「多轮工具调用 + 超时」会雪崩），
         # 直接给确定性兜底话术。Agent 与 RAG 生成同用一个 DashScope LLM 后端，故共用 llm_breaker。
         if not llm_breaker.allow_request():
             log.warning(f"LLM 熔断中，Agent 跳过 ReAct 直接兜底 | 问题={question[:40]}")
+            agent_fallback_total.labels("breaker").inc()
             final_text.append(AGENT_NO_ANSWER_FALLBACK)
             await queue.put(AGENT_NO_ANSWER_FALLBACK)
             return
+        agent_t0 = time.perf_counter()
         try:
             async for event in self.unified_agent.astream_events(
                 {"messages": turn.messages},
                 config={"recursion_limit": 10},
                 version="v1",
             ):
+                # ---- 工具调用观测：开始 / 完成 / 失败（日志自动带 request_id）----
                 if event["event"] == "on_tool_start":
                     tool_calls_this_round["n"] += 1
+                    tool_started[event.get("run_id", "")] = time.perf_counter()
+                    log.info(f"Agent 工具调用开始 | 第{tool_calls_this_round['n']}次 | "
+                             f"tool={event.get('name')} | 入参={_summarize_value((event.get('data') or {}).get('input'))}")
+                    continue
+                if event["event"] == "on_tool_end":
+                    tool = event.get("name") or "unknown"
+                    start = tool_started.pop(event.get("run_id", ""), None)
+                    if start is not None:
+                        elapsed = time.perf_counter() - start
+                        agent_tool_calls_total.labels(tool, "success").inc()
+                        agent_tool_duration_seconds.labels(tool).observe(elapsed)
+                        log.info(f"Agent 工具调用完成 | tool={tool} | 耗时={elapsed:.2f}s | "
+                                 f"输出={_summarize_value((event.get('data') or {}).get('output'))}")
+                    continue
+                if event["event"] == "on_tool_error":
+                    tool = event.get("name") or "unknown"
+                    agent_tool_calls_total.labels(tool, "error").inc()
+                    tool_started.pop(event.get("run_id", ""), None)
+                    log.warning(f"Agent 工具调用失败 | tool={tool} | "
+                                f"err={_summarize_value((event.get('data') or {}).get('error'))}")
                     continue
                 if event["event"] != "on_chat_model_stream":
                     continue
@@ -372,6 +473,7 @@ class AgentTurnService:
 
                 # 尚未遇到 Final Answer 标记：把推理文本吞进缓冲
                 buffer += content
+                reasoning_chars += len(content)
                 idx = buffer.find(marker)
                 if idx == -1:
                     # 丢弃推理内容，仅保留可能横跨分块的标记尾部
@@ -379,6 +481,8 @@ class AgentTurnService:
                         buffer = buffer[-(mlen - 1):]
                     continue
                 seen_final = True
+                # 推理链留痕：Thought 长度 + 工具轮次（正文推理文本本身仍不落日志，防刷屏）
+                log.info(f"Agent 结束推理进入作答 | Thought≈{reasoning_chars}字 | 工具调用={tool_calls_this_round['n']}次")
                 tail = buffer[idx + mlen:]
                 buffer = ""
                 if tail:
@@ -397,6 +501,7 @@ class AgentTurnService:
                 if pending:
                     if is_empty_answer(pending):
                         log.info(f"Agent 空答复改走兜底 | 问题={question[:40]}")
+                        agent_fallback_total.labels("empty_answer").inc()
                         pending = KNOWLEDGE_NO_ANSWER.format(contact=SERVICE_CONTACT)
                     final_text.append(pending)
                     await queue.put(pending)
@@ -412,6 +517,7 @@ class AgentTurnService:
                     # 模型只输出推理、没给正文（qwen 偶发），或正文是「无」这类空答复：
                     # 一律转确定性知识兜底，走 RAG 检索作答，避免用户拿到无意义的答复
                     log.warning(f"Agent 未产出有效正文，转知识兜底 | 原始内容={joined[:300]!r}")
+                    agent_fallback_total.labels("no_content").inc()
                     pieces = []
                     async for piece in stream_knowledge_answer(
                             self.retrieval_service, self.answer_generator,
@@ -425,9 +531,13 @@ class AgentTurnService:
             # 不重推 final_text[-1]：该段此前已流给客户端，重推会让末尾内容重复一遍；
             # 若异常发生在一段正文都没产出时，补一句兜底话术，避免用户拿到空响应
             if not final_text:
+                agent_fallback_total.labels("exception").inc()
                 final_text.append(AGENT_NO_ANSWER_FALLBACK)
                 await queue.put(AGENT_NO_ANSWER_FALLBACK)
         finally:
+            # Agent 整体耗时：覆盖本轮 ReAct 全流程（含多轮工具调用）。
+            # 缺此观测则「Agent 整体耗时分位」面板恒为空（指标有声明无埋点）。
+            agent_duration_seconds.observe(time.perf_counter() - agent_t0)
             answer = "".join(final_text)
             if answer:
                 await finalize_turn(turn.chat_history, question, answer)
@@ -505,6 +615,7 @@ class RagTurnService:
 
     async def stream(self, request: RAGRequest, session_id: str) -> tuple:
         """回答一个问题，返回 (异步文本流, 门控响应头)。"""
+        stream_started_at = time.perf_counter()   # TTFT 起算点（含检索耗时）
         # 缓存：无会话场景下同一问题命中直接秒回（避免再次走 6s 的 LLM）
         cache_key = None
         if request.session_id is None:
@@ -517,6 +628,10 @@ class RagTurnService:
                     # 缓存里存的是 dict（见 ResponseCache.set），必须按键取值：
                     # 此前写成 cached.answer 会在生成器里抛 AttributeError，
                     # 响应已返回 200，客户端只会收到空 body（表现为"某问题恒秒回空"）
+                    # 缓存命中单独打一个 path 标签：与真实生成路径分开，避免把毫秒级
+                    # 命中混进生成延迟直方图、把 P95 拉成失真值
+                    agent_ttft_seconds.labels("rag_cached").observe(
+                        max(time.perf_counter() - stream_started_at, 0.0))
                     yield cached["answer"]
 
                 # 命中缓存也要回填门控头，否则客户端无法区分"命中"与"降级"
@@ -535,9 +650,10 @@ class RagTurnService:
             headers = _gate_headers(retriever_type, gate_info)
             chat_history = init_chat_history(session_id)
             queue: asyncio.Queue = asyncio.Queue()
+            stream_q = _StreamQueue(queue, _TTFTRecorder(stream_started_at, "rag"))
             _spawn_producer(
                 self._produce_rag(request, session_id, docs, chat_history,
-                                 cache_key, retriever_type, gate_info, queue),
+                                 cache_key, retriever_type, gate_info, stream_q),
                 queue,
             )
 
@@ -588,6 +704,7 @@ class RagTurnService:
                 # 要么是「有」这类正常短答 → 原样透出
                 if is_empty_answer(pending):
                     log.info(f"RAG 空答复改走兜底 | 问题={request.question[:40]}")
+                    agent_fallback_total.labels("empty_answer").inc()
                     pending = KNOWLEDGE_NO_ANSWER.format(contact=SERVICE_CONTACT)
                 full_answer.append(pending)
                 await queue.put(pending)
@@ -606,6 +723,7 @@ class RagTurnService:
             log.error(f"RAG 流式生成失败: {e}", exc_info=True)
             # 一段正文都没流出就失败：补兜底话术，避免用户拿到空响应
             if not full_answer:
+                agent_fallback_total.labels("exception").inc()
                 full_answer.append(AGENT_NO_ANSWER_FALLBACK)
                 await queue.put(AGENT_NO_ANSWER_FALLBACK)
         finally:

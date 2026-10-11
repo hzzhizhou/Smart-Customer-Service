@@ -21,6 +21,7 @@ from retrieval.reranker import CrossEncoderReranker
 from retrieval.fusion import dedupe_docs
 from retrieval.query_enhancer import QueryEnhancer
 from shared.constants import looks_like_multi_question, split_sub_questions
+from utils.metrics import retrieval_stage_duration_seconds
 import time
 import asyncio
 
@@ -79,6 +80,7 @@ class RetrievalService:
         #    注意：必须用"当前会话"的历史做改写。若沿用构造时传入的全局共享 chat_history，
         #    历史会随所有请求累积，导致每条单轮请求都触发改写 LLM（约 +8s）。
         #    新会话历史为空时，rewrite_question 内部直接返回原问题，不调 LLM。
+        rewrite_start = time.time()
         if use_context:
             loop = asyncio.get_running_loop()
             from infrastructure.chat_history_factory import init_chat_history
@@ -92,11 +94,14 @@ class RetrievalService:
                 rewritten_question = original_question
         else:
             rewritten_question = original_question
+        retrieval_stage_duration_seconds.labels("rewrite").observe(time.time() - rewrite_start)
 
         # 3. 查询分解：一次提出多个问题时逐子问检索。
         #    整段拼成一个查询会让各子问题的候选互相挤占 RERANK_TOP_N 名额，
         #    靠后的子问题被挤出结果 → 生成层无据可依，该问静默消失（实测复现）。
+        decompose_start = time.time()
         sub_questions = await self._decompose_queries(rewritten_question)
+        retrieval_stage_duration_seconds.labels("decompose").observe(time.time() - decompose_start)
 
         log.debug(f"查询改写耗时:{time.time() - start_time}")
         retriever_time = time.time()
@@ -115,6 +120,8 @@ class RetrievalService:
                  f"子问数={len(sub_questions)},检索总耗时：{end_time:.2f}秒")
         # 回收预取任务（其内部已吞异常；这里确保不遗留未完成/未回收的后台任务）
         await asyncio.gather(prefetch_task, return_exceptions=True)
+        # 整段检索耗时（含预取回收）：与 rewrite/decompose/search/rerank 各阶段对账
+        retrieval_stage_duration_seconds.labels("total").observe(time.time() - start_time)
         return final_docs, retriever_type, gate_info
 
     async def _decompose_queries(self, question: str) -> List[str]:
@@ -154,11 +161,21 @@ class RetrievalService:
     async def _search_and_rerank(self, queries: List[str], retriever,
                                  rerank_query: str,
                                  filter_arg: Optional[dict]) -> List[Document]:
-        """按给定 metadata 过滤条件执行检索（可多查询）并重排。"""
+        """按给定 metadata 过滤条件执行检索（可多查询）并重排。
+
+        两段分开打点：召回（多查询并行）与精排（融合去重 + Cross-Encoder）。
+        CPU 环境下 Cross-Encoder 是检索侧主要耗时来源，拆开才能看出占比。
+        """
+        search_start = time.time()
         results_list = await asyncio.gather(
             *[retriever.ainvoke(q, filter=filter_arg) for q in queries])
         docs = [doc for sublist in results_list for doc in sublist]
-        return await self._merge_results(docs, rerank_query)
+        retrieval_stage_duration_seconds.labels("search").observe(time.time() - search_start)
+
+        rerank_start = time.time()
+        merged = await self._merge_results(docs, rerank_query)
+        retrieval_stage_duration_seconds.labels("rerank").observe(time.time() - rerank_start)
+        return merged
 
     async def _retrieve_one(self, search_question: str, rerank_question: str,
                             route_mode: str, filter_metadata: Optional[dict],

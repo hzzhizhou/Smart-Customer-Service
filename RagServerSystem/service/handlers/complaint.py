@@ -8,6 +8,7 @@ from typing import AsyncIterator
 
 from logs.log_config import log
 from service.handlers.context import TurnContext
+from utils.metrics import handoff_total
 from shared.reply_templates import (
     COMPLAINT_FALLBACK,
     SERVICE_CONTACT,
@@ -59,6 +60,7 @@ async def handle_complaint(ctx: TurnContext) -> AsyncIterator[str]:
         )
         # 写入会话开场白：该工单由此成为一场人工会话，用户端切到人工客服模式
         start_handoff_session(ticket["ticket_id"])
+        handoff_total.labels("complaint").inc()
         yield TICKET_CREATED.format(
             ticket_id=ticket["ticket_id"],
             created_at=ticket["created_at"],

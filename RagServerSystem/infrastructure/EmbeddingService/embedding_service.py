@@ -6,6 +6,7 @@ import asyncio
 from typing import List, Dict
 from functools import partial
 from logs.log_config import retrieval_layer_log as log
+from utils.metrics import cache_requests_total
 
 class EmbeddingService:
     def __init__(self, embedding_model):
@@ -26,16 +27,20 @@ class EmbeddingService:
             # 1. 检查缓存
             if cache_key in self._cache:
                 self.hit_count += 1
+                cache_requests_total.labels("embedding", "hit").inc()
                 log.info(f"Embedding 缓存命中 (hit={self.hit_count}, miss={self.miss_count}): {query[:30]}...")
                 return self._cache[cache_key]
 
             # 2. 检查是否有正在进行的计算
             if cache_key in self._pending:
+                # 单航班合并：同一文本正在算，等它的结果即可。既非命中也不是新计算，
+                # 故不计入 hit/miss（否则会把一次真实 embed 算两遍、污染命中率）。
                 log.info(f"Embedding 等待进行中的计算: {query[:30]}...")  # 提高日志级别以便观察
                 future = self._pending[cache_key]
                 # 释放锁后等待结果
             else:
                 self.miss_count += 1
+                cache_requests_total.labels("embedding", "miss").inc()
                 log.info(f"Embedding 缓存未命中，新计算 (hit={self.hit_count}, miss={self.miss_count}): {query[:30]}...")
                 future = asyncio.Future()
                 self._pending[cache_key] = future
