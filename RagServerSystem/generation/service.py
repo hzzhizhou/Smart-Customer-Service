@@ -18,6 +18,7 @@ from logs.log_config import generation_layer_log as log
 from infrastructure.chat_history_factory import init_chat_history
 from utils.output_guard import output_guard
 from utils.circuit_breaker import llm_breaker
+from utils.request_context import span
 from langchain_core.messages import HumanMessage, AIMessage
 import time
 
@@ -100,12 +101,13 @@ class AnswerGenerator:
             return
         try:
             full_answer = []
-            async for chunk in self.answer_chain.astream({
-                "question": question,
-                "context": context_str
-            }):
-                full_answer.append(chunk)
-                yield chunk
+            with span("llm.generate", kind="client"):
+                async for chunk in self.answer_chain.astream({
+                    "question": question,
+                    "context": context_str
+                }):
+                    full_answer.append(chunk)
+                    yield chunk
             llm_breaker.record_success()
             # 流式输出后做合规审查：若有风险，追加系统提示（不破坏已流式输出的内容）
             complete = "".join(full_answer)

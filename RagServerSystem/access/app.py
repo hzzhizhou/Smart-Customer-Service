@@ -20,13 +20,12 @@ import uvicorn
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
-from config.settings import API_HOST, API_PORT, RESPONSE_TIMEOUT
+from config.settings import API_HOST, API_PORT, RESPONSE_TIMEOUT, ENABLE_API_DOCS
 from logs.log_config import log
-from utils.security import DataSecurity
 from agent.service import create_unified_agent
 from access.middleware import RateLimiter, register_middleware, register_request_context_middleware
 from shared.schemas import AgentRequest, RAGRequest
-from access.routes.auth import require_user
+from access.routes.auth import require_admin, require_user
 from service.cache import ResponseCache
 from agent.dst.dst_manager import DSTManager
 from agent.dst.slot_extractor import SlotExtractor
@@ -41,16 +40,54 @@ from agent.intent_classifier import IntentClassifier
 from service.turn_service import AgentTurnService, RagTurnService
 
 
+def register_observability_routes(app) -> None:
+    """可观测性查询端点（C1 工具调用审计 / C2 调用链 span）；仅管理员可访问。
+
+    独立成模块级函数（与 admin/auth/handoff 子路由同风格）便于单独装配与测试。
+    """
+
+    @app.get("/observability/tool-calls", dependencies=[Depends(require_admin)])
+    async def tool_call_audit(tool_name: str = "", user_id: str = "",
+                              trace_id: str = "", status: str = "",
+                              limit: int = 100):
+        """工具调用审计查询（C1）：按工具/用户/链路/状态过滤，最新在前。
+
+        数据来自 agent_tool_calls 表（Agent 工具路径写入，见 service/turn/agent_turn.py 的 _record_tool_audit）。
+        """
+        from infrastructure import mysql_store
+        items = await asyncio.to_thread(
+            mysql_store.list_tool_calls, tool_name, user_id, trace_id, status, limit)
+        return {"items": items, "total": len(items)}
+
+    @app.get("/observability/traces/{trace_id}", dependencies=[Depends(require_admin)])
+    async def trace_spans(trace_id: str):
+        """按 trace_id 查调用链 span（C2）：内存环形缓冲中的 span 列表。
+
+        数据非持久化（重启即清空），用于定位「刚发生的慢/失败链路」。
+        """
+        from utils.request_context import get_trace_spans
+        spans = get_trace_spans(trace_id)
+        return {"trace_id": trace_id, "count": len(spans), "spans": spans}
+
+
 class RAGService:
     def __init__(self, retrieval_service, answer_generator, llm=None):
         self.retrieval_service = retrieval_service
         self.answer_generator = answer_generator
         self.llm = llm
         self.hybrid_retriever = retrieval_service.hybrid_retriever   # 兼容旧引用
-        self.app = FastAPI(title="企业级RAG服务", version="1.0")
+        # OpenAPI/交互文档默认关闭（ENABLE_API_DOCS=false），避免接口面与内部模型暴露到公网；
+        # 本地演示在 .env 设 ENABLE_API_DOCS=true 即可恢复 /docs。
+        self.app = FastAPI(
+            title="企业级RAG服务",
+            version="1.0",
+            docs_url="/docs" if ENABLE_API_DOCS else None,
+            redoc_url="/redoc" if ENABLE_API_DOCS else None,
+            openapi_url="/openapi.json" if ENABLE_API_DOCS else None,
+        )
         # 无会话场景的响应缓存：同一问题命中即秒回（实现见 service/cache.py）
         self.cache = ResponseCache()
-        # 速率限制：每个 API key 维护最近一分钟请求时间戳队列（实现见 access/middleware.py）
+        # 速率限制：按客户端 IP 维护最近一分钟请求时间戳队列（实现见 access/middleware.py）
         self.rate_limiter = RateLimiter()
 
         # ========== 服务层装配：两条流式入口的轮次编排（实现见 service/turn_service.py）==========
@@ -78,6 +115,7 @@ class RAGService:
         register_auth_routes(self.app)
         register_handoff_routes(self.app)
         register_user_order_routes(self.app)
+        register_observability_routes(self.app)
         self._register_middleware()
 
     def _register_routes(self):
@@ -123,10 +161,8 @@ class RAGService:
             独立任务里跑完并直接落库，这里的生成器只从队列转发，
             客户端断开不会丢掉该轮历史。
             """
-            # 鉴权
-            if not DataSecurity.validate_api_key(request.api_key):
-                raise HTTPException(status_code=401, detail="无效的API密钥")
-            # 会话 ID 按登录用户作用域化：历史/DST 都落在自己的命名空间下
+            # 鉴权由 require_user（Bearer 令牌）完成；会话 ID 按登录用户作用域化，
+            # 历史/DST 都落在自己的命名空间下
             session_id = resolve_session_id(user["user_id"], request.session_id or "")
             chunks, headers = await self.rag_turn_service.stream(request, session_id)
             return StreamingResponse(chunks, media_type="text/plain", headers=headers)
@@ -140,9 +176,8 @@ class RAGService:
             生成与 HTTP 连接解耦：答复在服务层的独立任务里跑完并直接落库，
             这里的生成器只从队列转发，客户端断开不会写坏历史。
             """
-            if not DataSecurity.validate_api_key(request.api_key):
-                raise HTTPException(status_code=401, detail="无效的API密钥")
-            # 会话 ID 按登录用户作用域化：历史/DST/工单归属都落在自己的命名空间下
+            # 鉴权由 require_user（Bearer 令牌）完成；会话 ID 按登录用户作用域化，
+            # 历史/DST/工单归属都落在自己的命名空间下
             session_id = resolve_session_id(user["user_id"], request.session_id or "")
             queue = await self.turn_service.start_turn(request.question, session_id, user)
 

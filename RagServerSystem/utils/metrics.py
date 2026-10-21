@@ -70,7 +70,38 @@ agent_tool_duration_seconds = Histogram(
     buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10)
 )
 
-# ====================== 流式体验与检索阶段指标 ======================
+# ===================== LLM 调用观测指标 =====================
+# 回答「模型调用花了多少、失败几次、烧了多少 token」。label 基数有界：
+# model 只有配置里的固定模型名，status 只有 success/error，type 只有 prompt/completion。
+llm_requests_total = Counter(
+    'web_agent_llm_requests_total',
+    'LLM calls by model and status',
+    ['model', 'status']              # status: success / error
+)
+
+llm_tokens_total = Counter(
+    'web_agent_llm_tokens_total',
+    'LLM tokens by model and type',
+    ['model', 'type']                # type: prompt / completion
+)
+
+llm_request_duration_seconds = Histogram(
+    'web_agent_llm_request_duration_seconds',
+    'LLM call duration by model and status',
+    ['model', 'status'],
+    buckets=(0.1, 0.25, 0.5, 1, 2, 4, 8, 15, 30)
+)
+
+# 首 token 延迟（模型侧）：衡量「模型多久开始出字」，与整轮 TTFT（web_agent_ttft_seconds）
+# 区分开——后者含检索/路由耗时，这里只看模型本身。
+llm_ttft_seconds = Histogram(
+    'web_agent_llm_ttft_seconds',
+    'LLM time to first token by model',
+    ['model'],
+    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 3, 5, 8, 15)
+)
+
+# ===================== 流式体验与检索阶段指标 ======================
 # 首 token 延迟（TTFT）：用户从提问到看见第一个字的等待时间。
 # 流式场景只看整轮耗时没有意义：生成 10s 但 0.5s 就开始出字，体验远好于 3s 才吐第一个字，
 # 两者整轮耗时可能相同。path 只有 agent / rag / rag_cached 三种，基数有界。
