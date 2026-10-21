@@ -168,14 +168,15 @@ async def _run_mainline(ctx: TurnContext) -> str:
     _oid = dst.slots.get("order_id")
     if _oid:
         from agent.dst.order_validator import validate_return_order
-        _owner_check = await asyncio.to_thread(
+        _check = await asyncio.to_thread(
             validate_return_order, _oid, owner_id=user_id)
-        if _owner_check["status"] == "forbidden":
+        if not _check["valid"]:
             dst.stage = Stage.COLLECTING
-            dst.slots.pop("order_id", None)  # 清掉非本人单号，免得下一轮继续复用
+            dst.slots.pop("order_id", None)  # 清掉无效单号，免得下一轮继续复用
             await ctx.dst_manager.save(dst)
-            log.warning(f"退货/退款归属校验拦截 | session={ctx.session_id} | 订单={_oid}")
-            return _owner_check["message"]
+            log.warning(f"退货/退款订单校验拦截 | session={ctx.session_id} | "
+                        f"订单={_oid} | 状态={_check['status']}")
+            return _check["message"]
 
     # 2) COLLECTING：必要槽位缺失 → 礼貌补齐提问
     missing = [k for k in required_slots(intent) if not dst.slots.get(k)]

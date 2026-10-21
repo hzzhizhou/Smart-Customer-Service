@@ -22,6 +22,10 @@ class _SaveStub:
     async def save(self, state):
         self.saved += 1
 
+    def merge_new_slots(self, dst, new_slots):
+        dst.slots.update(new_slots)
+        return dst
+
 
 class _Ctx:
     """最小 TurnContext：取消/完成分支都不触达 slot_extractor 与检索。"""
@@ -75,3 +79,58 @@ def test_product_listing_question_scores_as_consult():
     scores = IntentClassifier(llm=None, mode="rule").rule_scores(
         "你们有哪几种产品在卖，推荐一下")
     assert scores.get("consult", 0.0) >= 2.0
+
+
+def test_fabricated_order_rejected_at_slot_fill(monkeypatch):
+    """虚构订单号必须在填充阶段就被退回，不得进入确认环节。
+
+    实测（2026-10-21）："订单号1233423112" 曾一路走到「已为您核对退货信息：
+    回复"确认"即可提交」——填充期只拦归属（forbidden），not_found 全放行。
+    修复后：拿到订单号立即全量校验（存在性/归属/可退），不通过当场清槽退回。
+    """
+    import agent.dst.order_validator as ov
+
+    def _fake_validate(order_id, owner_id=""):
+        return {"valid": False, "status": "not_found", "order_id": order_id,
+                "status_raw": None,
+                "message": f"很抱歉，未查询到订单号 **{order_id}** 的订单，"
+                           f"请核对后重新提供正确的订单号。"}
+
+    monkeypatch.setattr(ov, "validate_return_order", _fake_validate)
+
+    class _Extractor:
+        async def extract(self, question, intent, slots):
+            return {"order_id": "1233423112"}
+
+    ctx = _Ctx("订单号1233423112", Stage.COLLECTING)
+    ctx.slot_extractor = _Extractor()
+    answer = _collect(ctx)
+    assert "未查询到订单号" in answer
+    assert "已为您核对" not in answer          # 不得再进入确认话术
+    assert "order_id" not in ctx.dst.slots      # 无效单号被清掉
+    assert ctx.dst.stage == Stage.COLLECTING    # 阶段退回继续收集
+    assert ctx.dst_manager.saved == 1
+
+
+def test_foreign_order_rejected_at_slot_fill(monkeypatch):
+    """他人订单同样在填充阶段拦截（该分支此前已存在，锁住防回归）。"""
+    import agent.dst.order_validator as ov
+
+    def _fake_validate(order_id, owner_id=""):
+        return {"valid": False, "status": "forbidden", "order_id": order_id,
+                "status_raw": "paid",
+                "message": f"订单 **{order_id}** 不在当前登录账号名下，"
+                           f"无法为您办理退货/退款。"}
+
+    monkeypatch.setattr(ov, "validate_return_order", _fake_validate)
+
+    class _Extractor:
+        async def extract(self, question, intent, slots):
+            return {"order_id": "SO20241120001"}
+
+    ctx = _Ctx("订单号SO20241120001", Stage.COLLECTING)
+    ctx.slot_extractor = _Extractor()
+    answer = _collect(ctx)
+    assert "不在当前登录账号名下" in answer
+    assert "order_id" not in ctx.dst.slots
+    assert ctx.dst.stage == Stage.COLLECTING
