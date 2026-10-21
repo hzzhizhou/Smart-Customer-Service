@@ -31,13 +31,18 @@ def _is_confirmation(question: str) -> bool:
                ("确认", "是的", "对的", "可以", "确定", "同意", "提交", "办理", "就这么办"))
 
 
+CANCEL_HINTS = ("不退货", "不退了", "不想退", "不退款", "算了", "取消", "不用了", "先不办")
+
+
 async def handle_return_refund(ctx: TurnContext) -> AsyncIterator[str]:
     """产出退货/退款引导答复（收集槽位 → 确认 → 登记工单）。"""
     try:
         yield await _run_mainline(ctx)
     except Exception as e:
         log.error(f"退货/退款主流程异常: {e}", exc_info=True)
-        yield "抱歉，办理退货遇到一点问题，我这就转人工帮您处理。"
+        # 同样不能空口承诺转接：异常分支没有建单，用户等不到人工接入。
+        yield ("抱歉，办理退货/退款时遇到系统问题，暂时无法确认本次操作的结果。\n"
+               "请稍后重试，或回复“退货进度”核实；如需人工客服协助，直接回复“转人工”。")
 
 
 async def _run_mainline(ctx: TurnContext) -> str:
@@ -48,6 +53,15 @@ async def _run_mainline(ctx: TurnContext) -> str:
     intent = dst.intent
     user_id = ctx.user["user_id"]
     subject = "退货" if intent == "return" else "退款"
+
+    # 取消闸门必须先于一切分支：它不依赖意图分类，也不依赖 DONE 文案，
+    # 用户在任何收集/确认阶段说"不办了"都能立刻退出主线。
+    if dst.stage in (Stage.COLLECTING, Stage.CONFIRMING) \
+            and any(k in ctx.question for k in CANCEL_HINTS):
+        dst.intent, dst.stage, dst.slots = "chat", Stage.COLLECTING, {}
+        await ctx.dst_manager.save(dst)
+        log.info(f"退货/退款取消 | session={ctx.session_id} | 问题={ctx.question[:40]}")
+        return f"好的，已取消本次{subject}申请，不会创建工单。您还有其他问题吗？"
 
     # 已完成流程防护：上一轮已登记工单（DONE），用户再提 return/refund 时
     # 不应拿旧槽位重复走"确认提交"（否则每轮都复读确认语，且会重复建单）。
