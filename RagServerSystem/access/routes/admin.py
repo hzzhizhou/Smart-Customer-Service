@@ -13,7 +13,7 @@ from pathlib import Path
 from fastapi import Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel
 
-from config.settings import BASE_DIR
+from config.settings import ALLOWED_EXTENSIONS, BASE_DIR, MAX_FILE_SIZE
 from access.routes.auth import require_admin
 from infrastructure import mysql_store
 from shared.reply_templates import RETURN_STAGES, RETURN_STAGE_EXCEPTIONS
@@ -71,8 +71,8 @@ def register_admin_routes(app, retrieval_service):
     async def list_tickets(status: str = "", page: int = 1, page_size: int = 10):
         page = max(page, 1)
         page_size = min(max(page_size, 1), 100)
-        items = mysql_store.list_tickets_paged(status or None, page, page_size)
-        total = mysql_store.count_tickets(status or None)
+        items = await asyncio.to_thread(mysql_store.list_tickets_paged, status or None, page, page_size)
+        total = await asyncio.to_thread(mysql_store.count_tickets, status or None)
         return {
             "items": items,
             "total": total,
@@ -86,7 +86,7 @@ def register_admin_routes(app, retrieval_service):
         """后台订单列表（分页，可按状态筛选）。"""
         page = max(page, 1)
         page_size = min(max(page_size, 1), 100)
-        items, total = mysql_store.list_all_orders(status or None, page, page_size)
+        items, total = await asyncio.to_thread(mysql_store.list_all_orders, status or None, page, page_size)
         return {
             "items": items,
             "total": total,
@@ -99,7 +99,7 @@ def register_admin_routes(app, retrieval_service):
         """后台更新订单状态（发货/签收/退款中/取消等）。"""
         if req.status not in _ORDER_STATUS:
             raise HTTPException(status_code=400, detail=f"非法状态，可选：{', '.join(sorted(_ORDER_STATUS))}")
-        row = mysql_store.update_order_status(order_id, req.status)
+        row = await asyncio.to_thread(mysql_store.update_order_status, order_id, req.status)
         if row is None:
             raise HTTPException(status_code=404, detail=f"订单不存在: {order_id}")
         return row
@@ -107,7 +107,7 @@ def register_admin_routes(app, retrieval_service):
     @app.get("/tickets/{ticket_id}", dependencies=[Depends(require_admin)])
     async def ticket_detail(ticket_id: str):
         """工单详情：单条工单全字段（含处理备注）。"""
-        row = mysql_store.get_ticket(ticket_id)
+        row = await asyncio.to_thread(mysql_store.get_ticket, ticket_id)
         if row is None:
             raise HTTPException(status_code=404, detail=f"工单不存在: {ticket_id}")
         return row
@@ -124,8 +124,8 @@ def register_admin_routes(app, retrieval_service):
             raise HTTPException(status_code=400, detail=f"非法环节，可选：{', '.join(sorted(_TICKET_STAGE))}")
         if req.status is None and req.note is None and req.stage is None:
             raise HTTPException(status_code=400, detail="至少提供 status、note 或 stage 之一")
-        row = mysql_store.update_ticket_status(
-            ticket_id, req.status, req.note, req.stage)
+        row = await asyncio.to_thread(
+            mysql_store.update_ticket_status, ticket_id, req.status, req.note, req.stage)
         if row is None:
             raise HTTPException(status_code=404, detail=f"工单不存在: {ticket_id}")
         return row
@@ -138,15 +138,26 @@ def register_admin_routes(app, retrieval_service):
         data_dir.mkdir(parents=True, exist_ok=True)
         # 仅取文件名，剔除路径分隔符，防路径穿越
         filename = Path(file.filename or "unnamed").name
-        from config.settings import ALLOWED_EXTENSIONS
         if Path(filename).suffix.lower() not in ALLOWED_EXTENSIONS:
             raise HTTPException(
                 status_code=400,
                 detail=f"不支持的文件类型，仅支持: {ALLOWED_EXTENSIONS}",
             )
         target = data_dir / filename
-        content = await file.read()
-        target.write_bytes(content)
+        # 逐块读并计量：中间件按 Content-Length 预检，但 chunked 传输不带该头，
+        # 所以这里必须真的边读边卡，否则超限文件仍会把内存撑爆
+        buf = bytearray()
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            buf.extend(chunk)
+            if len(buf) > MAX_FILE_SIZE:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"文件超过上限 {MAX_FILE_SIZE} 字节",
+                )
+        await asyncio.to_thread(target.write_bytes, bytes(buf))
 
         # 后台任务：上传返回后异步走统一入库（增量，写 MySQL 状态）
         def run_ingest():
