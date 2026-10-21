@@ -1,8 +1,9 @@
 # Prometheus 抓取配置：抓后端 /metrics（FastAPI + prometheus_client 默认文本格式）。
 #
-# 目标地址随部署方式二选一（改 targets 即可）：
-#   - prometheus 与 app 同在 docker 网络 → app:8000
-#   - prometheus 跑在宿主机            → host.docker.internal:8000（或本机直接用 127.0.0.1:8000）
+# 默认目标 app:8000（与 docker-compose 的可观测栈一致：prometheus 与 app 同在容器网络）。
+# 若 Prometheus 跑在宿主机、后端也在宿主机，把 targets 改成 host.docker.internal:8000
+# （Linux 需给 prometheus 容器加 extra_hosts: ["host.docker.internal:host-gateway"]，
+#   或直接用 127.0.0.1:8000）；改完重启 prometheus 生效。
 #
 # 抓取间隔 15s / 保留 15 天（保留期在启动命令 --storage.tsdb.retention.time=15d 里设）。
 global:
@@ -14,7 +15,8 @@ scrape_configs:
   - job_name: rag-app
     metrics_path: /metrics
     static_configs:
-      # compose 部署时改回 "app:8000"；本地起后端验证时用 host.docker.internal:8000
-      - targets: ["host.docker.internal:8000"]
+      # 与 docker-compose 的 prometheus/app 同网络：容器内用服务名解析到 app:8000。
+      # 本地宿主机跑后端调试时改回 host.docker.internal:8000（Linux 需加 host-gateway）。
+      - targets: ["app:8000"]
         labels:
           service: rag-agent

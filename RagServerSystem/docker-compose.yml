@@ -2,7 +2,7 @@
 #
 # 用法：
 #   1. 准备 .env：cp .env.example .env，填 DASHSCOPE_API_KEY；
-#      Redis_password 必须与 deploy/redis/conf/redis.conf 里的 requirepass 一致
+#      Redis_password 由 compose 注入 redis 容器（不再写死在 redis.conf）
 #   2. docker compose up -d --build
 #   3. 首次启动 app 容器检测到向量库为空会自动入库（DashScope embedding，约 1-2 分钟），
 #      docker compose logs -f app 看到 "Uvicorn running" 即就绪
@@ -40,12 +40,15 @@ services:
     image: redis:7-alpine
     container_name: rag-redis
     restart: unless-stopped
-    command: redis-server /usr/local/etc/redis/redis.conf
+    # 口令不写进 redis.conf（版本库）：由 .env 的 Redis_password 注入；留空则不启用鉴权
+    environment:
+      REDIS_PASSWORD: ${Redis_password}
+    command: sh -c 'redis-server /usr/local/etc/redis/redis.conf --requirepass "$$REDIS_PASSWORD"'
     volumes:
       - ./deploy/redis/conf/redis.conf:/usr/local/etc/redis/redis.conf:ro
       - redis-data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping 2>/dev/null | grep -q PONG || redis-cli ping 2>/dev/null | grep -q PONG"]
       interval: 10s
       timeout: 5s
       retries: 3
