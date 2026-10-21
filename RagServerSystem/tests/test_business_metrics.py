@@ -186,17 +186,34 @@ class TestHandoffMetrics:
         assert _counter("web_agent_handoff_total",
                         {"reason": "user_request"}) == before
 
-    def test_agent_tool_counted(self, monkeypatch):
+    def test_agent_tool_counted(self, monkeypatch, tool_identity):
         import agent.tools.ticket_tool as tt
         import service.handoff_service as hs
         monkeypatch.setattr(tt, "create_ticket_record", lambda *a, **k: _fake_ticket("other"))
-        monkeypatch.setattr(hs, "start_handoff_session", lambda tid: None)
+        # 新会话：start_handoff_session 返回开场白记录，才计一次 agent_tool
+        monkeypatch.setattr(hs, "start_handoff_session", lambda tid: {"msg_id": 1})
         before = _counter("web_agent_handoff_total", {"reason": "agent_tool"})
 
-        tt.create_ticket.invoke({"user_id": "u1", "description": "明天天气怎么样"})
+        # 账号由服务端上下文注入（工具参数里已无 user_id）
+        tool_identity("u1")
+        tt.create_ticket.invoke({"description": "明天天气怎么样"})
 
         assert _counter("web_agent_handoff_total",
                         {"reason": "agent_tool"}) == before + 1
+
+    def test_agent_tool_reused_session_not_counted(self, monkeypatch, tool_identity):
+        import agent.tools.ticket_tool as tt
+        import service.handoff_service as hs
+        monkeypatch.setattr(tt, "create_ticket_record", lambda *a, **k: _fake_ticket("other"))
+        # 幂等命中已有会话：没有写新开场白（None），不应把转人工率灌水
+        monkeypatch.setattr(hs, "start_handoff_session", lambda tid: None)
+        before = _counter("web_agent_handoff_total", {"reason": "agent_tool"})
+
+        tool_identity("u1")
+        tt.create_ticket.invoke({"description": "明天天气怎么样"})
+
+        assert _counter("web_agent_handoff_total",
+                        {"reason": "agent_tool"}) == before
 
     def test_reasons_are_bounded(self):
         import utils.metrics as m

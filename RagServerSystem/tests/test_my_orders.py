@@ -5,6 +5,9 @@
   1) 只列本登录账号名下订单（不串到他人）；
   2) 拿不到账号时拒答，而不是按会话/最近订单去猜；
   3) 「列出订单」与「办理业务 / 问方法」的问法能区分开，避免误拦。
+
+注：账号已改为服务端上下文注入（agent.tools.tool_context），用例用 tool_identity
+夹具绑定登录账号，工具参数里不再有 owner_id。
 """
 import pytest  # noqa: F401  （pytest 注入 monkeypatch，导入以声明测试依赖）
 
@@ -51,19 +54,21 @@ def test_blank_account_returns_nothing():
 
 
 # ---------- list_my_orders 工具 ----------
-def test_lists_only_own_orders(monkeypatch):
+def test_lists_only_own_orders(monkeypatch, tool_identity):
     monkeypatch.setattr(oq, "list_orders_by_user",
                         lambda uid, limit=20: ([_order("SO20241121006", uid),
                                                _order("SO20241120005", uid)], 2))
-    out = oq.list_my_orders.invoke({"owner_id": "owner1"})
+    tool_identity("owner1")
+    out = oq.list_my_orders.invoke({})
     assert "您名下共 2 张订单" in out
     assert "SO20241120005" in out and "SO20241121006" in out
     assert "已发货" in out and "¥4999.00" in out
 
 
-def test_empty_account_gets_hint_not_blank(monkeypatch):
+def test_empty_account_gets_hint_not_blank(monkeypatch, tool_identity):
     monkeypatch.setattr(oq, "list_orders_by_user", lambda uid, limit=20: ([], 0))
-    out = oq.list_my_orders.invoke({"owner_id": "owner1"})
+    tool_identity("owner1")
+    out = oq.list_my_orders.invoke({})
     assert "还没有订单" in out
 
 
@@ -71,13 +76,14 @@ def test_missing_owner_is_refused(monkeypatch):
     called = []
     monkeypatch.setattr(oq, "list_orders_by_user",
                         lambda uid, limit=20: called.append(uid) or ([_order("SO1", "owner1")], 1))
+    # 未绑定身份（上下文里没有账号）：连库都不查，更不猜账号
     out = oq.list_my_orders.invoke({})
     assert "没能确认您的登录账号" in out
     assert called == []      # 缺账号时连库都不查（不猜账号）
     assert "SO1" not in out
 
 
-def test_limit_is_clamped_to_max(monkeypatch):
+def test_limit_is_clamped_to_max(monkeypatch, tool_identity):
     seen = {}
 
     def fake(uid, limit=20):
@@ -85,13 +91,15 @@ def test_limit_is_clamped_to_max(monkeypatch):
         return [], 0
 
     monkeypatch.setattr(oq, "list_orders_by_user", fake)
-    oq.list_my_orders.invoke({"owner_id": "owner1", "limit": 999})
+    tool_identity("owner1")
+    oq.list_my_orders.invoke({"limit": 999})
     assert seen["limit"] == oq.MY_ORDERS_MAX
 
 
-def test_more_than_limit_hints_single_query(monkeypatch):
+def test_more_than_limit_hints_single_query(monkeypatch, tool_identity):
     monkeypatch.setattr(oq, "list_orders_by_user",
                         lambda uid, limit=20: ([_order("SO1", uid)], 5))
-    out = oq.list_my_orders.invoke({"owner_id": "owner1"})
+    tool_identity("owner1")
+    out = oq.list_my_orders.invoke({})
     assert "共 5 张订单" in out and "以下是最新的 1 张" in out
     assert "请告诉我订单号" in out

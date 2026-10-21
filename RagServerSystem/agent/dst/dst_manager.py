@@ -10,6 +10,7 @@ DST 会话状态管理器（对话状态跟踪）
 存储策略：MySQL（infrastructure/mysql_store.conversation_state 表），
 不依赖 Redis；模块内热缓存加速高频读。
 """
+import asyncio
 import json
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -41,12 +42,16 @@ class DSTManager:
         # 热缓存：加速同会话高频读；重启后重建、回源 MySQL
         self._mem_cache: Dict[str, ConversationState] = {}
 
-    def load(self, session_id: str) -> ConversationState:
-        """读取会话状态；无则返回默认 COLLECTING 空状态"""
+    async def load(self, session_id: str) -> ConversationState:
+        """读取会话状态；无则返回默认 COLLECTING 空状态。
+
+        读写走线程池：DST 在每轮问答的入口与收尾都会被调用，而底层 pymysql 是同步
+        阻塞调用，直接在事件循环里查库会让并发请求排队。
+        """
         cached = self._mem_cache.get(session_id)
         if cached is not None:
             return cached
-        row = _get_state(session_id)
+        row = await asyncio.to_thread(_get_state, session_id)
         if row is None:
             st = ConversationState(session_id=session_id)
         else:
@@ -63,10 +68,10 @@ class DSTManager:
         self._mem_cache[session_id] = st
         return st
 
-    def save(self, state: ConversationState) -> None:
+    async def save(self, state: ConversationState) -> None:
         """写入 MySQL + 更新热缓存"""
         state.updated_at = datetime.now().isoformat(timespec="seconds")
-        _upsert_state({
+        await asyncio.to_thread(_upsert_state, {
             "session_id": state.session_id,
             "intent": state.intent,
             "slots": state.slots,

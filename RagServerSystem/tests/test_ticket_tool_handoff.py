@@ -23,7 +23,7 @@ def _fake_ticket(category: str) -> dict:
     }
 
 
-def test_create_ticket_tool_opens_handoff_session(monkeypatch):
+def test_create_ticket_tool_opens_handoff_session(monkeypatch, tool_identity):
     """超范围问题（分类 other）建单后，必须开启人工会话让工作台可见。"""
     opened = []
     monkeypatch.setattr(ticket_tool, "create_ticket_record",
@@ -31,12 +31,13 @@ def test_create_ticket_tool_opens_handoff_session(monkeypatch):
     monkeypatch.setattr(handoff_service, "start_handoff_session",
                         lambda tid: opened.append(tid))
 
-    ticket_tool.create_ticket.invoke({"user_id": "u1", "description": "明天天气怎么样"})
+    tool_identity("u1")
+    ticket_tool.create_ticket.invoke({"description": "明天天气怎么样"})
 
     assert opened == ["TK-AI-1"]
 
 
-def test_create_ticket_tool_skips_handoff_for_return(monkeypatch):
+def test_create_ticket_tool_skips_handoff_for_return(monkeypatch, tool_identity):
     """退货/退款有 stage 阶段流转，不能当成人工会话开启。"""
     opened = []
     monkeypatch.setattr(ticket_tool, "create_ticket_record",
@@ -44,6 +45,7 @@ def test_create_ticket_tool_skips_handoff_for_return(monkeypatch):
     monkeypatch.setattr(handoff_service, "start_handoff_session",
                         lambda tid: opened.append(tid))
 
-    ticket_tool.create_ticket.invoke({"user_id": "u1", "description": "我要退货"})
+    tool_identity("u1")
+    ticket_tool.create_ticket.invoke({"description": "我要退货"})
 
     assert opened == []

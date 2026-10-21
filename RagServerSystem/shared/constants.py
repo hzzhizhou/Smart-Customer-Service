@@ -139,60 +139,6 @@ def looks_like_multi_question(question: str) -> bool:
     return any(_iter_split_connectors(text))
 
 
-# ---------- ReAct 推理文本清洗 ----------
-# ReAct 推理标记：qwen 偶尔把 ReAct 格式当普通文本输出（不走结构化 tool_calls），
-# 且不吐 "Final Answer:" 标记，导致推理内容混进面向用户的答复。
-# 行首标记用于定位推理段落；Action Input 不锚定行首，因为模型可能整段挤在一行。
-_REACT_LINE_RE = re.compile(r"^[ \t]*(Thought|Action|Observation)\s*[:：]", re.I | re.M)
-_ACTION_INPUT_RE = re.compile(r"Action\s*Input\s*[:：]", re.I)
-
-
-def _json_end(text: str, start: int) -> int:
-    """返回 start 之后首个 JSON 对象的结束位置（跳过括号配平）；无 JSON 则原样返回。"""
-    i = start
-    while i < len(text) and text[i] in " \t":
-        i += 1
-    if i >= len(text) or text[i] != "{":
-        return start
-    depth = 0
-    while i < len(text):
-        if text[i] == "{":
-            depth += 1
-        elif text[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return i + 1
-        i += 1
-    return len(text)
-
-
-def _line_end(text: str, start: int) -> int:
-    nl = text.find("\n", start)
-    return len(text) if nl == -1 else nl
-
-
-def strip_react_preamble(text: str) -> str:
-    """剥离混入答复的 ReAct 推理文本，只保留面向用户的正文。
-
-    流式输出依靠 "Final Answer:" 标记切掉推理段；模型没吐该标记时兜底分支会把
-    Thought/Action/Action Input 原文透给用户（实测“XX 怎么样”即触发）。
-    这里取「最后一段推理之后」的内容：模型既可能逐行输出推理，也可能整段挤在一行，
-    因此对含 JSON 的 Action Input 按 JSON 结束位置切，避免连带删掉同行正文。
-    """
-    cut = 0
-    for m in _ACTION_INPUT_RE.finditer(text):
-        cut = max(cut, _json_end(text, m.end()))
-    for m in _REACT_LINE_RE.finditer(text):
-        line_end = _line_end(text, m.end())
-        inline = _ACTION_INPUT_RE.search(text, m.end(), line_end)
-        if inline:
-            # 同一行里还塞着 Action Input，按 JSON 结束位置切
-            cut = max(cut, _json_end(text, inline.end()))
-        else:
-            cut = max(cut, line_end)
-    return text[cut:].strip()
-
-
 # 模型偶发把「无 / 无相关信息」这类空答复当成正文吐出来（多见于没带订单号的查询类问题，
 # 如实测的「如何查询订单？」），对用户毫无价值，按「没答上来」处理，转确定性知识兜底。
 _EMPTY_ANSWER_RE = re.compile(

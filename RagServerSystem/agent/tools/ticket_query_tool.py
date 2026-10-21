@@ -7,7 +7,6 @@
 回答完整度标准（对齐企业客服话术四要素）：
 当前环节 + 已完成哪些环节 + 下一步谁做什么 + 时效承诺 + 联系方式。
 """
-import re
 import sys
 from pathlib import Path
 
@@ -17,14 +16,15 @@ from langchain_core.tools import tool
 
 from logs.log_config import log
 from infrastructure.mysql_store import query_ticket_progress
+from agent.tools.tool_context import current_user_id
 from shared.reply_templates import (
-    NEED_ORDER_NO,
     NO_TICKET,
     RETURN_PROGRESS,
     RETURN_PROGRESS_ABNORMAL,
     RETURN_PROGRESS_NOTE,
     RETURN_STAGE_EXCEPTIONS,
     SERVICE_CONTACT,
+    TICKET_NEED_LOGIN,
     TICKET_PROGRESS_NO_NOTE,
     TICKET_PROGRESS_WITH_NOTE,
     category_cn,
@@ -37,6 +37,9 @@ from shared.reply_templates import (
 
 # 走阶段化流转的售后分类
 _STAGED_CATEGORY = {"return", "refund"}
+# 允许按业务过滤的分类白名单（防止模型传中文/乱值把查询收窄成空结果）
+_VALID_QUERY_CATEGORY = {"return", "refund", "complaint", "consult", "technical",
+                         "logistics", "other"}
 
 
 def _render_staged_progress(ticket: dict, subject: str) -> str:
@@ -73,24 +76,27 @@ def _render_staged_progress(ticket: dict, subject: str) -> str:
     )
 
 
-@tool(description="根据订单号或用户标识查询该用户最近一张工单的处理进度：退货/退款类工单会返回当前业务环节、流转轨迹、下一步与时效；其他工单返回处理状态与人工客服备注。当用户询问'退货办到哪一步了/工单处理得怎么样/投诉有结果吗/转人工后续怎么处理'时调用。owner_id 传「当前用户账号标识」（系统提示中给出），用于把查询限定在本账号名下；不传时会退化为按订单号全库匹配，可能查到他人工单。")
-def query_ticket(user_id: str = "", owner_id: str = "") -> str:
+@tool(description="查询当前登录账号名下工单的处理进度：退货/退款类工单会返回当前业务环节、流转轨迹、下一步与时效；其他工单返回处理状态与人工客服备注。当用户询问'退货办到哪一步了/工单处理得怎么样/投诉有结果吗/转人工后续怎么处理'时调用。建议传入 category（return 退货 / refund 退款 / complaint 投诉）限定「问的是哪件业务的工单」，避免在同时有退货单和投诉单时查串。本工具没有账号参数也不需要账号：归属账号由服务端按当前登录账号自动注入。")
+def query_ticket(order_id: str = "", category: str = "") -> str:
     """
     智能客服工单进度查询工具：
-    - 输入：user_id 订单号（如 SO20241120005）或「当前用户账号标识」（系统提示中给出）
-    - 输入：owner_id 当前用户账号标识，用于限定工单归属（种子订单号被多账号共用，
-      不加限定会出现「查到别人工单」）
+    - 输入：order_id 订单号（如 SO20241120005）。不带时按当前登录账号查最近一张工单。
+    - 输入：category 要查的业务分类（return/refund/complaint/...），用户明确在问某件业务的
+      进度时传入，避免「先建退货单、后建投诉单」时把投诉单当成退货进度返回。
     - 输出：最近一张工单的处理进度（阶段化售后为完整环节说明 + 人工客服答复回传）
     """
-    query = (user_id or "").strip()
-    if not query:
-        return NEED_ORDER_NO
-    # 归属账号只认账号标识（32 位十六进制），防止模型误填订单号后把查询收窄成空结果
-    _owner = (owner_id or "").strip()
-    owner = _owner if re.fullmatch(r"[0-9a-f]{32}", _owner) else ""
-    log.info(f"客服工具 query_ticket 被调用，查询依据：{query}，归属限定：{owner or '无'}")
+    # 身份只认服务端登录态：工具参数里已无账号字段，模型无从伪造（PROJECT_AUDIT P0-3）
+    owner = current_user_id()
+    if not owner:
+        log.warning("query_ticket 缺少登录账号，拒绝查询")
+        return TICKET_NEED_LOGIN
 
-    ticket = query_ticket_progress(query, owner=owner)
+    query = (order_id or "").strip() or owner
+    _category = (category or "").strip() if (category or "").strip() in _VALID_QUERY_CATEGORY else ""
+    log.info(f"客服工具 query_ticket 被调用，查询依据：{query}，归属限定：{owner}，"
+             f"业务分类：{_category or '不限'}")
+
+    ticket = query_ticket_progress(query, owner=owner, category=_category)
     if not ticket:
         return NO_TICKET
 
@@ -112,7 +118,10 @@ def query_ticket(user_id: str = "", owner_id: str = "") -> str:
 
 
 if __name__ == "__main__":
+    # 身份改由服务端注入后，脚本里要先显式绑定账号才有归属上下文
+    from agent.tools.tool_context import set_current_user
+    set_current_user("demo-owner")
     print("--- 查询退货工单（按订单号）---")
-    print(query_ticket.invoke({"user_id": "SO20241120005"}))
+    print(query_ticket.invoke({"order_id": "SO20241120005", "category": "return"}))
     print("--- 空参数 ---")
-    print(query_ticket.invoke({"user_id": ""}))
+    print(query_ticket.invoke({}))

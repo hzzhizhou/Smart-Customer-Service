@@ -12,6 +12,7 @@ from langchain_core.tools import tool
 from logs.log_config import log
 from utils.metrics import order_queries_total, order_not_found_total
 from infrastructure.mysql_store import can_access_order, get_order, list_orders_by_user
+from agent.tools.tool_context import current_user_id
 from shared.reply_templates import (
     MY_ORDERS_EMPTY,
     MY_ORDERS_HEADER,
@@ -27,15 +28,17 @@ from shared.reply_templates import (
 MY_ORDERS_MAX = 10
 
 
-@tool(description="根据订单号查询订单状态、物流轨迹、金额等信息（仅查询订单本身的物流/状态）。注意：若用户询问的是'工单/售后处理进度、处理结果、投诉结果'，这是查工单，请调用 query_ticket 而非本工具。owner_id 传「当前用户账号标识」（系统提示中给出），用于校验订单归属；不传时归属校验会拒绝有归属的订单。")
-def query_order(order_id: str, owner_id: str = "") -> str:
+@tool(description="根据订单号查询订单状态、物流轨迹、金额等信息（仅查询订单本身的物流/状态）。注意：若用户询问的是'工单/售后处理进度、处理结果、投诉结果'，这是查工单，请调用 query_ticket 而非本工具。本工具没有账号参数也不需要账号：订单归属由服务端按当前登录账号自动校验。")
+def query_order(order_id: str) -> str:
     """
     智能售后客服订单查询工具：
     - 输入：order_id 订单号（如 SO20241120005）
-    - 输入：owner_id 当前用户账号标识，用于订单归属校验（非本人订单不予返回）
     - 输出：订单详情（客户姓名已脱敏，合规要求）
+    - 归属账号由服务端注入（agent.tools.tool_context），不由 LLM 传参决定
     """
     order_queries_total.inc()
+    # 身份只来自服务端登录态：LLM 参数里已无该字段，提示注入无处可填（PROJECT_AUDIT P0-3）
+    owner_id = current_user_id()
     log.info(f"客服工具 query_order 被调用，订单号：{order_id}，归属账号：{owner_id or '无'}")
 
     order = get_order(order_id)
@@ -67,16 +70,15 @@ def query_order(order_id: str, owner_id: str = "") -> str:
 
 
 # ====================== 智能售后客服工具指标 ======================
-@tool(description="列出「当前登录账号名下」的订单（最近的若干张，含订单号/状态/商品/金额/下单时间）。当用户没有提供订单号、问'我有哪些订单/我名下所有订单/我买过什么/我的订单列表'时调用本工具，不要因为缺订单号就只追问订单号。owner_id 必须传「当前用户账号标识」（系统提示中给出）：不传时无法确认账号，不会返回任何订单。")
-def list_my_orders(owner_id: str = "", limit: int = MY_ORDERS_MAX) -> str:
+@tool(description="列出「当前登录账号名下」的订单（最近的若干张，含订单号/状态/商品/金额/下单时间）。当用户没有提供订单号、问'我有哪些订单/我名下所有订单/我买过什么/我的订单列表'时调用本工具，不要因为缺订单号就只追问订单号。本工具没有账号参数也不需要账号：归属账号由服务端自动注入，你无法也不应该自行指定。")
+def list_my_orders(limit: int = MY_ORDERS_MAX) -> str:
     """
     智能售后客服「我名下订单」查询工具：
-    - 输入：owner_id 当前用户账号标识（必传，用于限定只列本账号订单）
     - 输入：limit 最多列出多少张（缺省/越界时取 MY_ORDERS_MAX）
     - 输出：订单列表（仅本账号；不含客户姓名；超出上限时提示可用订单号单独查）
     """
     order_queries_total.inc()
-    uid = (owner_id or "").strip()
+    uid = current_user_id()
     log.info(f"客服工具 list_my_orders 被调用，归属账号：{uid or '无'}")
     if not uid:
         # 没有账号上下文时不做任何猜测（例如按会话、按最近订单兜底都会越权）
