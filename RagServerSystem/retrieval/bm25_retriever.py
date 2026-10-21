@@ -13,6 +13,7 @@ from utils.thread_pool_manager import get_thread_pool, init_thread_pools
 from config.settings import RETRIEVER_K, BM25_ASYNC_TIMEOUT, BM25_SCORE_THRESHOLD  # 新增阈值导入
 from utils.tokenizer import tokenizer
 from logs.log_config import retrieval_layer_log as log
+from retrieval.filters import matches_filter
 import time
 from functools import partial
 
@@ -104,14 +105,14 @@ class Bm25Retriever(BaseRetriever):
             )[:self.k]  # 取前k条（最多k条）
             
             # 4. 构建返回文档列表（支持 metadata filter 后置过滤）
+            #    过滤语义与向量库共用 matches_filter：必须认 $in，否则多类别预过滤
+            #    会把 BM25 路整个清空，混合检索静默退化成纯向量（PROJECT_AUDIT §4.2(1)）
             filter_condition = kwargs.get('filter')
             filtered_docs = []
             for idx in sorted_valid_indices:
                 metadata = {**self._metadatas[idx], "bm25_score": float(scores[idx])}
-                # 应用 metadata filter（如 layer/merchant_id/product_id 多租户隔离）
-                if filter_condition:
-                    if not all(metadata.get(k) == v for k, v in filter_condition.items()):
-                        continue
+                if filter_condition and not matches_filter(metadata, filter_condition):
+                    continue
                 filtered_docs.append(Document(page_content=self._docs[idx], metadata=metadata))
             
             # 5. 日志输出过滤结果

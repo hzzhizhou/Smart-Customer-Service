@@ -131,7 +131,9 @@ class _SubQRetrieval(RetrievalService):
         return SimpleNamespace(), "hybrid_retriever"
 
     async def _search_and_rerank(self, queries, retriever, rerank_query, filter_arg):
-        return list(self.docs_by_query.get(queries[0], []))
+        # 契约：(重排后的 TOP-N, 重排前的召回候选)。本桩不重排，两者相同。
+        docs = list(self.docs_by_query.get(queries[0], []))
+        return docs, docs
 
 
 def _scored_doc(content, score):

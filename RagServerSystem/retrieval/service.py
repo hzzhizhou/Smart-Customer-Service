@@ -10,7 +10,7 @@ from langchain_core.documents import Document
 from config.settings import (
     ROUTE_MODE, CONFIDENCE_HIGH_THRESHOLD, CONFIDENCE_LOW_THRESHOLD,
     CONFIDENCE_MARGIN_THRESHOLD, DOC_CATEGORY_PRIORITY, DOC_CATEGORY_KEYWORDS,
-    RERANK_MODE, RERANK_TOP_N
+    RERANK_MODE, RERANK_TOP_N, AUTO_FILTER_DEFAULT
 )
 from logs.log_config import retrieval_layer_log as log
 from retrieval.bm25_retriever import Bm25Retriever
@@ -22,6 +22,7 @@ from retrieval.fusion import dedupe_docs
 from retrieval.query_enhancer import QueryEnhancer
 from shared.constants import looks_like_multi_question, split_sub_questions
 from utils.metrics import retrieval_stage_duration_seconds
+from utils.request_context import span
 import time
 import asyncio
 
@@ -62,7 +63,7 @@ class RetrievalService:
                  use_multi: bool = False,
                  session_id: str = None,
                  filter_metadata: Optional[dict] = None,
-                 auto_filter: bool = False) -> Tuple[List[Document], str, dict]:
+                 auto_filter: bool = AUTO_FILTER_DEFAULT) -> Tuple[List[Document], str, dict]:
         start_time = time.time()
         original_question = question
 
@@ -107,12 +108,14 @@ class RetrievalService:
         retriever_time = time.time()
 
         if len(sub_questions) > 1:
-            final_docs, retriever_type, gate_info = await self._retrieve_per_sub_question(
-                sub_questions, route_mode, filter_metadata, auto_filter)
+            with span("retrieval.retrieve", kind="client"):
+                final_docs, retriever_type, gate_info = await self._retrieve_per_sub_question(
+                    sub_questions, route_mode, filter_metadata, auto_filter)
         else:
-            final_docs, retriever_type, gate_info = await self._retrieve_one(
-                rewritten_question, original_question, route_mode,
-                filter_metadata, auto_filter, use_hyde, use_multi)
+            with span("retrieval.retrieve", kind="client"):
+                final_docs, retriever_type, gate_info = await self._retrieve_one(
+                    rewritten_question, original_question, route_mode,
+                    filter_metadata, auto_filter, use_hyde, use_multi)
 
         end_time = time.time() - retriever_time
         log.info(f"检索完成，检索器={retriever_type}，返回文档数={len(final_docs)},"
@@ -160,22 +163,32 @@ class RetrievalService:
 
     async def _search_and_rerank(self, queries: List[str], retriever,
                                  rerank_query: str,
-                                 filter_arg: Optional[dict]) -> List[Document]:
+                                 filter_arg: Optional[dict]
+                                 ) -> Tuple[List[Document], List[Document]]:
         """按给定 metadata 过滤条件执行检索（可多查询）并重排。
+
+        返回 (重排后的 TOP-N, 重排前的召回候选)。两者必须分开返回
+        （PROJECT_AUDIT §4.2(2)）：门控衡量的是「这一轮召回可不可靠」，
+        重排只负责重新排序。若把门控建在重排后的 TOP-N 上，重排一旦把向量分最高的
+        文档挤出前 N，门控看到的分就不再代表召回置信度，会误判 low 转人工。
+        因此 merge 的输入仍是原始召回结果（排序行为不变），门控另用去重后的候选集。
 
         两段分开打点：召回（多查询并行）与精排（融合去重 + Cross-Encoder）。
         CPU 环境下 Cross-Encoder 是检索侧主要耗时来源，拆开才能看出占比。
         """
         search_start = time.time()
-        results_list = await asyncio.gather(
-            *[retriever.ainvoke(q, filter=filter_arg) for q in queries])
-        docs = [doc for sublist in results_list for doc in sublist]
+        with span("retrieval.search", kind="client"):
+            results_list = await asyncio.gather(
+                *[retriever.ainvoke(q, filter=filter_arg) for q in queries])
+        candidates = [doc for sublist in results_list for doc in sublist]
         retrieval_stage_duration_seconds.labels("search").observe(time.time() - search_start)
 
         rerank_start = time.time()
-        merged = await self._merge_results(docs, rerank_query)
+        with span("retrieval.rerank", kind="client"):
+            merged = await self._merge_results(candidates, rerank_query)
         retrieval_stage_duration_seconds.labels("rerank").observe(time.time() - rerank_start)
-        return merged
+        # 门控只看「召回候选」（去重后），与重排结果解耦
+        return merged, dedupe_docs(candidates)
 
     async def _retrieve_one(self, search_question: str, rerank_question: str,
                             route_mode: str, filter_metadata: Optional[dict],
@@ -192,12 +205,16 @@ class RetrievalService:
         elif use_hyde:
             queries = [await self.query_enhancer.hyde(search_question)]
 
-        docs = await self._search_and_rerank(queries, retriever, rerank_question, filter_arg)
+        docs, candidates = await self._search_and_rerank(
+            queries, retriever, rerank_question, filter_arg)
         if filter_arg and not docs:
             # 过滤后一条都不剩（关键词猜错类别 / 该类目无内容）→ 回退全库，宁可多检索也不漏答
             log.info(f"预过滤后无命中，回退全库检索 | filter={filter_arg}")
-            docs = await self._search_and_rerank(queries, retriever, rerank_question, None)
-        return docs, retriever_type, self._compute_confidence_gate(docs)
+            docs, candidates = await self._search_and_rerank(
+                queries, retriever, rerank_question, None)
+        with span("retrieval.gate", kind="internal"):
+            gate = self._compute_confidence_gate(candidates)
+        return docs, retriever_type, gate
 
     async def _retrieve_per_sub_question(self, sub_questions: List[str], route_mode: str,
                                          filter_metadata: Optional[dict],
@@ -211,19 +228,22 @@ class RetrievalService:
         子问没有直接语料（top 0.54 → low），连能答的「iPhone 15 4999 元」也一并被放弃，
         整轮回"没查到可靠的资料"（G3）——用户明明有一半问题是可以答的。
         """
-        async def _one(sub_q: str) -> Tuple[List[Document], str]:
+        async def _one(sub_q: str) -> Tuple[List[Document], List[Document], str]:
             retriever, retriever_type = await self.router.route(sub_q, route_mode)
             filter_arg = self._infer_filter(sub_q, filter_metadata, auto_filter)
-            docs = await self._search_and_rerank([sub_q], retriever, sub_q, filter_arg)
+            docs, candidates = await self._search_and_rerank([sub_q], retriever, sub_q, filter_arg)
             if filter_arg and not docs:
                 log.info(f"预过滤后无命中，回退全库检索 | 子问={sub_q} filter={filter_arg}")
-                docs = await self._search_and_rerank([sub_q], retriever, sub_q, None)
-            return docs, retriever_type
+                docs, candidates = await self._search_and_rerank([sub_q], retriever, sub_q, None)
+            return docs, candidates, retriever_type
 
         results = await asyncio.gather(*[_one(q) for q in sub_questions])
-        doc_lists = [docs for docs, _ in results]
-        retriever_type = "+".join(dict.fromkeys(t for _, t in results))
-        gates = [self._compute_confidence_gate(docs) for docs in doc_lists]
+        doc_lists = [docs for docs, _, _ in results]
+        recall_lists = [candidates for _, candidates, _ in results]
+        retriever_type = "+".join(dict.fromkeys(t for _, _, t in results))
+        # 门控按各子问的「召回候选」计算，与重排结果解耦（PROJECT_AUDIT §4.2(2)）
+        with span("retrieval.gate", kind="internal"):
+            gates = [self._compute_confidence_gate(candidates) for candidates in recall_lists]
 
         answerable = [(docs, gate) for docs, gate in zip(doc_lists, gates)
                       if gate["level"] != "low"]
@@ -279,6 +299,9 @@ class RetrievalService:
         """
         置信度门控：基于绝对相似度判断是否需要转人工
 
+        入参是**重排前的召回候选**（见 _search_and_rerank 的返回值），不是重排后的 TOP-N：
+        这样门控衡量的是"召回可不可靠"，与"重排把谁排前面"解耦（PROJECT_AUDIT §4.2(2)）。
+
         双信号判断：
           1. 主信号 = vector_score（=1-distance/2，即余弦相似度，绝对分、范围 [0,1]，语义稳定）
              - >= CONFIDENCE_HIGH_THRESHOLD → high 候选，直接回答
@@ -287,6 +310,9 @@ class RetrievalService:
           2. 辅信号 = margin（top - 第二名），衡量排序稳定性
              - high 但 margin < 阈值 → 降级 medium（多个候选分数接近，排序不稳健）
 
+        已知边界：整批候选都来自 BM25 路（无 vector_score）时，主信号无值 → 判 low。
+        默认 ROUTE_MODE="rule" 只会路由到 hybrid/vector，因此线上不会落到该分支；
+        只有在 llm 路由模式且模型选中 bm25_retriever 时才会出现。
         """
         if not docs:
             return {
