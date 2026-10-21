@@ -15,7 +15,7 @@ import asyncio
 import time
 from pathlib import Path
 
-from config.settings import BASE_DIR
+from config.settings import BASE_DIR, validate_chunk_config
 from logs.log_config import data_layer_log as log
 from infrastructure.vector_store.async_chroma_vector import ChromaVector
 from ingestion.loader.mysql_data_loader import StreamDocumentLoader
@@ -38,6 +38,12 @@ class DataLayer:
             raise FileNotFoundError(f"数据目录不存在: {dir_path}")
         if mode not in ("incremental", "full"):
             raise ValueError(f"不支持的 mode: {mode}（可选 incremental/full）")
+
+        # 启动校验分块配置（PROJECT_AUDIT §4.2(3)）：分块超长会被嵌入模型静默截断，
+        # 检索质量下降却没有任何报错。只告警不阻断（切回本地 bge 是使用者的显式选择），
+        # 也不重建索引 —— 分块参数变更须重新入库才生效。
+        for warning in validate_chunk_config():
+            log.warning(f"分块配置校验：{warning}")
 
         vector = ChromaVector()
         loader = StreamDocumentLoader()

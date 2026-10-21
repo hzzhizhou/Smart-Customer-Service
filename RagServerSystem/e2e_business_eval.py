@@ -10,21 +10,18 @@
   expect=ticket  应创建工单并给出工单号
   expect=any     只要求给出实质回应（闲聊/软性场景）
 
-依赖：服务已在 8000 运行；MySQL/Redis/DashScope 可用；customer/customer123 为
-种子订单归属账号（3 张演示订单挂其名下）。
+依赖：服务已在 8000 运行；MySQL/Redis/DashScope 可用；演示买家账号（默认名 customer，
+口令取自环境变量 DEFAULT_BUYER_PASSWORD）为种子订单归属账号（3 张演示订单挂其名下）。
 """
 import json
+import os
 import re
 import sys
 import time
-from pathlib import Path
 
 import urllib.request
 
 BASE = "http://127.0.0.1:8000"
-ROOT = Path(__file__).parent
-API_KEY = re.search(r"DASHSCOPE_API_KEY=\s*(\S+)",
-                    (ROOT / ".env").read_text(encoding="utf-8")).group(1)
 
 TOKEN = ""
 # 进入退货/退款办理流的标志话术（政策咨询类问题出现它即判错）
@@ -149,7 +146,7 @@ def use_account(username, password):
 def ask(question, timeout=180):
     req = urllib.request.Request(
         BASE + "/agent/stream",
-        data=json.dumps({"question": question, "api_key": API_KEY}).encode(),
+        data=json.dumps({"question": question}).encode(),
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {TOKEN}"},
         method="POST")
     t0 = time.time()
@@ -181,7 +178,8 @@ def judge(text: str, expect: str, rule: dict):
 
 
 def main():
-    use_account("customer", "customer123")
+    use_account(os.getenv("DEFAULT_BUYER_USERNAME", "customer"),
+                os.getenv("DEFAULT_BUYER_PASSWORD", ""))
     results = []
     print(f"共 {len(CASES) + len(AUTH_CASES)} 题\n" + "=" * 60)
     last_cat = ""

@@ -1,7 +1,8 @@
 """
 智能售后客服 RAG 客服 · 在线端到端验证
 前置：服务已在 8000 运行、MySQL/Redis 可用、DashScope key 有效；
-会话类接口需登录态，脚本会自动用 admin/admin123 登录（首次启动时后端自动建号）。
+会话类接口需登录态，脚本用环境变量里的管理员账号登录
+（首次启动时后端自动建号；账号名取 DEFAULT_ADMIN_USERNAME，口令取 DEFAULT_ADMIN_PASSWORD）。
 覆盖场景：
   S1 健康检查
   S2 RAG 知识库问答
@@ -10,25 +11,22 @@
   S5 投诉转人工（create_ticket 工具）
 """
 import json
-import re
+import os
 import sys
 import time
-from pathlib import Path
 
 import urllib.request
 
 BASE = "http://127.0.0.1:8000"
-ROOT = Path(__file__).parent
-
-# 读取 .env 里的 key
-_env = (ROOT / ".env").read_text(encoding="utf-8")
-API_KEY = re.search(r"DASHSCOPE_API_KEY=\s*(\S+)", _env).group(1)
 
 # 会话类接口（/rag/stream、/agent/stream、/history/*）都要登录态，
 # 统一用管理员账号登录：管理接口（如 /health 之外的看板接口）也只认管理员。
+# 默认账号口令不再写死在代码里（见 access/routes/auth.py），故从环境变量读取：
+#   DEFAULT_ADMIN_USERNAME / DEFAULT_ADMIN_PASSWORD（未设账号名则回退 admin）
 TOKEN = ""
 UID = ""
-ADMIN = ("admin", "admin123")
+ADMIN = (os.getenv("DEFAULT_ADMIN_USERNAME", "admin"),
+         os.getenv("DEFAULT_ADMIN_PASSWORD", ""))
 
 
 def _login(username: str, password: str) -> dict:
@@ -141,7 +139,7 @@ def main():
     # S2 RAG 知识库问答（流式）
     step("2", "RAG 知识库问答 (退货流程)")
     try:
-        ans, lat = _stream("/rag/stream", {"question": "退货流程是怎么样的？", "api_key": API_KEY})
+        ans, lat = _stream("/rag/stream", {"question": "退货流程是怎么样的？"})
         print(f"  latency={lat}s")
         print(f"  answer: {ans[:120]}")
         # 「无相关信息」与空答复兜底话术都代表"这题没答上来"，S2 必须判失败：
@@ -155,7 +153,7 @@ def main():
     # S3 Agent 订单查询（流式）
     step("3", "Agent 订单查询 (SO20241120005)")
     try:
-        ans, lat = _stream("/agent/stream", {"question": "帮我查一下订单 SO20241120005 现在到哪了", "api_key": API_KEY})
+        ans, lat = _stream("/agent/stream", {"question": "帮我查一下订单 SO20241120005 现在到哪了"})
         print(f"  latency={lat}s")
         print(f"  answer: {ans[:160]}")
         if not ans:
@@ -168,8 +166,8 @@ def main():
     step("4", "多轮对话 + DST 状态跟踪")
     try:
         sid = "e2e_dst_test_001"
-        a1, _ = _stream("/agent/stream", {"question": "我要退货", "session_id": sid, "api_key": API_KEY})
-        a2, _ = _stream("/agent/stream", {"question": "订单号 SO20241120005，商品破损", "session_id": sid, "api_key": API_KEY})
+        a1, _ = _stream("/agent/stream", {"question": "我要退货", "session_id": sid})
+        a2, _ = _stream("/agent/stream", {"question": "订单号 SO20241120005，商品破损", "session_id": sid})
         print(f"  第1轮: {a1[:80]}")
         print(f"  第2轮: {a2[:80]}")
         if not a1 or not a2:
@@ -203,7 +201,7 @@ def main():
     step("5", "投诉转人工 (create_ticket)")
     try:
         ans, lat = _stream("/agent/stream",
-                           {"question": "我要投诉！商品质量太差了，客服也不接电话，我要投诉", "api_key": API_KEY})
+                           {"question": "我要投诉！商品质量太差了，客服也不接电话，我要投诉"})
         print(f"  latency={lat}s")
         print(f"  answer: {ans[:160]}")
         if not ans:
