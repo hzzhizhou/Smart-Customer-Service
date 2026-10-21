@@ -18,17 +18,19 @@ STOP_WORDS = BASE_DIR / "config"/"stop_words.txt"
 LLM_MODEL = "deepseek-v4.1-flash"#换更快的模型：qwen-turbo 比 qwen3-max 快很多，效果差异不大。
 LLM_TEMPERATURE = 0.01  # 无幻觉：固定温度
 LLM_SEED = 42        # 固定随机种子（结果稳定）
+# 单次 LLM 调用超时（秒）。流式下该值即「两个 chunk 之间的读超时」：
+# 模型挂住不出字时抛异常，由生成层/Agent 的兜底话术接住，避免一轮请求无限期占住连接。
+LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "30"))
 
 # ====================== 嵌入模型配置 ======================
 EMBEDDING_BACKEND = "dashscope"    # "dashscope" 或 "local"（云端约0.5s，本地CPU bge-base 20s+）
 # LOCAL_EMBEDDING_MODEL = "D:/RAG-Windows/AI大模型与智能体开发/models/bge-small-zh-v1.5"#---512维
 LOCAL_EMBEDDING_MODEL = "D:/RAG-Windows/AI大模型与智能体开发/models/bge-base-zh-v1.5"#--768维,本地下载的模型地址
 # 云端模型（仅当 EMBEDDING_BACKEND="dashscope" 时使用）
-DASHSCOPE_EMBEDDING_MODEL = "qwen3.7-text-embedding"
+DASHSCOPE_EMBEDDING_MODEL = "qwen3.7-text-embedding-flash"# 1024维
 DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")  # 从.env读取
 
 # ====================== LLM OpenAI 兼容模式 ======================
-# 说明：通义原生 ChatTongyi/dashscope 无法识别 qwen3.7-flash 模型名（报 url error），
 # 统一改用 DashScope 的 OpenAI 兼容端点（compatible-mode）。key、模型均为通义账号，仅调用协议不同。
 # LLM 工厂函数见 utils/llm_factory.py（config 仅保留纯配置，不含运行时逻辑）
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
@@ -38,20 +40,25 @@ CHUNK_SIZE = 768               # 分块大小（适配LLM上下文）
 CHUNK_OVERLAP = 128             # 块重叠（避免上下文丢失）
 MIN_CHUNK_SIZE = 50             # 最小块长度（低于该值的块不入库，避免无效 embedding）
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 最大文件大小（10MB，规避内存溢出）
+# 单请求体上限（含 multipart 上传）：超限直接 413，不读 body、不进业务路由。
+# 必须大于 MAX_FILE_SIZE，给 multipart 边界与表单头留余量；
+# 上传文件本身在路由里另按 MAX_FILE_SIZE 卡一遍（防止单文件超限靠分块头部撑大）。
+MAX_REQUEST_BODY_SIZE = int(os.getenv("MAX_REQUEST_BODY_SIZE", str(12 * 1024 * 1024)))
 ALLOWED_EXTENSIONS = [".txt", ".pdf", ".docx", ".xlsx", ".md", ".csv"]  # 允许的文件格式
+
+# 建单幂等窗口（秒）：同账号 + 同订单 + 同分类在此窗口内视为「同一次申请」，
+# 由 tickets.idempotency_key 唯一键兜底，并发/重试只会留下第一张工单。
+# 窗口外的再次提交会新建工单，避免一次误操作把该业务永久锁死。
+TICKET_IDEMPOTENCY_WINDOW = int(os.getenv("TICKET_IDEMPOTENCY_WINDOW", "300"))
+
+# metadata 预过滤（按问题关键词推断文档类别）的全局策略。
+# 该开关决定召回范围，必须只有一个来源：/rag/stream、Agent 的 search_knowledge、
+# 知识兜底与离线评测全部走这里，否则同一问题在不同入口召回范围不同，评测结论不可比。
+AUTO_FILTER_DEFAULT = os.getenv("AUTO_FILTER", "true").lower() != "false"
 
 
 # ====================== 分块策略配置 ======================
 CHUNKING_STRATEGY = "recursive"  # 可选: recursive, semantic, sliding_window, parent_child, combined_splitter
-# 默认策略为 recursive：本知识库语料为 9 篇短文 + 2 份表格（约 40KB），单篇正文多不足
-# 768 字符，按 Markdown 标题切分后块已接近自然段落，无需再做分层。
-# combined_splitter（语义父块 + 递归子块）保留为可选策略，它的收益来自「父块显著大于
-# 子块」：父块 2000 字预算要求单个语义段本身就足够长，语料里没有万字级长文档时，
-# 实测父块 avg 425 / 子块上限 400 已是同一量级（18 个父块里 9 个只切出 1 个子块），
-# 分层退化为重复存储。换成长文档语料后可再切回该策略。
-#   - 子块 CHILD_CHUNK_SIZE=400 字符 ≈ 400 tokens < bge-base-zh-v1.5 的 512 上限，嵌入不截断
-#   - 父块不进向量库（仅存 parent_cache.json 供生成层补上下文），不受 512 限制
-#   - 父子回填目前只在 /rag/stream 生效，前端走 Agent 路径（search_knowledge 直接取块内容）
 SEMANTIC_EMBEDDING_MODEL = "D:/RAG-Windows/AI大模型与智能体开发/models/bge-base-zh-v1.5"#--768维
 SEMANTIC_CHUNK_THRESHOLD = 0.75   # 句子相似度阈值（低于则切分）
 SEMANTIC_BUFFER_SIZE = 2           # 切分时前后保留的句子数
@@ -66,8 +73,35 @@ CHILD_CHUNK_SIZE = 400             # 子块大小
 CHILD_CHUNK_OVERLAP = 40           # 子块重叠
 
 TABLE_CHUNK_SIZE = 1000            # 表格块大小（表头 + 约 5~6 行）
-# 注意：该值需 ≤ 嵌入模型上限。当前 EMBEDDING_BACKEND="dashscope"（上限 8k token）安全；
-# 若切回本地 bge（512 token，中文约 1 字 1 token），1000 字符会超出而被静默截断。
+
+# 嵌入模型单条输入上限（token）：分块长度必须 ≤ 该值，否则末尾内容会被嵌入模型静默截断，
+# 召回随之下降却没有任何报错 —— 属于「配置一换就坏」的隐患（PROJECT_AUDIT §4.2(3)）。
+# 按后端取上限：dashscope 的 qwen text-embedding 上限 8192；
+# 本地 bge 系列 512（中文约 1 字 1 token）。
+EMBEDDING_MODEL_MAX_TOKENS = 8192 if EMBEDDING_BACKEND == "dashscope" else 512
+# 分块后追加的【标题 > 章节】前缀预留长度（见 ingestion/splitter/base.prepend_section_path）
+CHUNK_PREFIX_OVERHEAD = 60
+
+
+def validate_chunk_config() -> list:
+    """启动校验：分块配置会不会被嵌入模型静默截断（PROJECT_AUDIT §4.2(3)）。
+
+    返回告警文案列表（空列表 = 自洽）。只告警、不 raise：切回本地 bge 是使用者的
+    显式选择，不该让服务起不来；但必须在启动时把「会被截断」这件事喊出来，
+    否则问题只体现在检索质量上、看板无信号。
+
+    注意：这里只做校验，**不重建索引** —— 分块参数变更须重新入库才会生效。
+    """
+    warnings = []
+    for name, size in (("CHUNK_SIZE", CHUNK_SIZE), ("TABLE_CHUNK_SIZE", TABLE_CHUNK_SIZE)):
+        budget = size + CHUNK_PREFIX_OVERHEAD   # 标题前缀也计入块长度
+        if budget > EMBEDDING_MODEL_MAX_TOKENS:
+            warnings.append(
+                f"{name}={size}（含标题前缀预留 {CHUNK_PREFIX_OVERHEAD}，合计 {budget}）"
+                f"超过嵌入模型上限 {EMBEDDING_MODEL_MAX_TOKENS} token："
+                f"末尾内容会被静默截断，请调小该值或改用上限更大的嵌入模型"
+            )
+    return warnings
 
 
 # 检索层配置
@@ -96,13 +130,11 @@ DOC_CATEGORY_KEYWORDS = {
 VECTOR_WEIGHT = 0.6            # weighted 策略下的向量权重
 ROUTE_MODE = "rule"            # 路由模式：rule/llm/hybrid
 
-# ====================== 重排（融合结果 → Cross-Encoder 精排） ======================
+# ========== 重排（融合结果 → Cross-Encoder 精排） ==========
 RERANK_TOP_N = 5
 # cross_encoder：用本地 Cross-Encoder 重排；none：关闭重排，直接返回融合序（可灰度/排障）
 RERANK_MODE = "cross_encoder"
 # 本地重排模型目录（BAAI/bge-reranker-base 的完整权重，非 sentence-transformers 缓存）
-# 容器内该目录默认不存在，需自行挂载并用环境变量覆盖；缺失时重排器会降级为不重排
-# （保持融合序并告警），不会让检索整体失败。
 RERANK_MODEL_PATH = os.getenv("RERANK_MODEL_PATH",
                               str(BASE_DIR.parent / "models" / "bge-reranker-base"))
 # 送进 Cross-Encoder 的候选上限：CPU 下打分耗时与候选数成正比，截断以控延迟
@@ -110,11 +142,6 @@ RERANK_MODEL_PATH = os.getenv("RERANK_MODEL_PATH",
 RERANK_CANDIDATES = 20
 
 # 置信度门控阈值（量纲 = 余弦相似度 cos）
-# vector_score = 1 - distance/2：Chroma 建集合未指定度量 → 默认 l2，返回「平方」L2 距离；
-# 库内向量已单位化（范数=1）→ cos = 1 - d/2，与余弦相似度同量纲、是绝对分，语义稳定。
-# 旧实现用 1/(1+d) 属量纲错配（2026-09-26 修正）：实测语料内 cos 0.53~0.81 / 语料外 0.33~0.57，
-# 换算后只有 0.43~0.73，真实差距被压扁，high/low 两档同时失去区分力。
-# 注意：fusion_score 是 Min-Max 批次内相对分，一批全差时 top 仍会被拉到 1.0，不能用于门控。
 CONFIDENCE_HIGH_THRESHOLD = 0.80    # top cos >= 该值且 margin 充足 → high，直接回答
 CONFIDENCE_LOW_THRESHOLD = 0.55     # < 该值 → low，转人工
 CONFIDENCE_MARGIN_THRESHOLD = 0.08  # top 与第二名差距 < 该值 → 排序不稳，high 降级为 medium
@@ -134,6 +161,7 @@ INTENT_LLM_FALLBACK_CONFIDENCE = 0.5  # 规则识别置信度低于该值时才�
 # 轻量接入：请求前加载跨轮会话状态（意图/槽位/阶段），响应后 LLM 提取槽位回写。
 # 置 False 时整体行为与未接入前一致（可灰度）。
 DST_ENABLED = True
+
 
 # 业务意图 → 优先工具 映射（供 Agent 决策提示 + 路由参考）
 INTENT_TOOL_MAP = {
@@ -164,6 +192,11 @@ CACHE_MAXSIZE = 1000           # 缓存最大条数
 CACHE_TTL = 300                # RAG 响应缓存有效期（秒），TTL 内命中秒回，过期自动失效
 RESPONSE_TIMEOUT = 30          # API响应超时时间
 RATE_LIMIT_PER_MINUTE = 60     # 每个 API key 每分钟最大请求数（限流，防滥用）
+# API 交互文档（/docs、/redoc、/openapi.json）：默认关闭，避免把接口面与内部模型暴露到公网；
+# 本地演示可设 ENABLE_API_DOCS=true 打开。
+ENABLE_API_DOCS = os.getenv("ENABLE_API_DOCS", "false").strip().lower() in ("1", "true", "yes", "on")
+# 登录令牌有效期（小时）：过期的令牌查库即失效，返回 401 要求重新登录；默认 7 天。
+TOKEN_TTL_HOURS = int(os.getenv("TOKEN_TTL_HOURS", "168"))
 # 订单/工单/用户/会话等业务数据落在 MySQL（见 infrastructure/mysql_store.py），
 # 连接参数取文件末尾的 MYSQL_* 配置。
 
