@@ -198,7 +198,36 @@ class ChromaVector(BaseVectorStore):
                 texts[i:i + EMBED_BATCH],
             )
             embeddings.extend(chunk)
-        
+
+        # 维度自检：换嵌入模型（如 qwen3.7-text-embedding → ...-flash）后，
+        # 旧集合的维度可能不同；直接 upsert 会被 Chroma 以含糊异常拒绝。
+        # 这里先读一条旧向量，给出「请全量重建索引」的明确错误。
+        if embeddings:
+            try:
+                probe = await loop.run_in_executor(
+                    self._executor,
+                    lambda: self.vector_store._collection.get(
+                        limit=1, include=["embeddings"]),
+                )
+                old_vectors = (probe or {}).get("embeddings")
+                # 空集合时 chromadb 返回 numpy 空数组：对它做 `x or []` 会触发
+                # ValueError: The truth value of an empty array is ambiguous
+                # （全量重建时集合刚被清空，正是这个场景），必须先判 None、再看 size。
+                if old_vectors is None:
+                    old_vectors = []
+                old_dim = len(old_vectors[0]) if len(old_vectors) else 0
+                new_dim = len(embeddings[0])
+                if old_dim and old_dim != new_dim:
+                    raise ValueError(
+                        f"嵌入维度不一致：集合中已有向量 {old_dim} 维，当前模型输出 {new_dim} 维。"
+                        f"请全量重建索引（ingestion.service full）或切回原嵌入模型。"
+                    )
+            except ValueError:
+                raise
+            except Exception as e:
+                # 读不到旧向量（空集合/接口差异）不应阻断入库，交给后续 upsert 自己校验
+                log.warning(f"嵌入维度自检跳过（读取旧向量失败）: {e}")
+
         # 分批 upsert
         for i in range(0, total, batch_size):
             batch_ids = ids[i:i+batch_size]

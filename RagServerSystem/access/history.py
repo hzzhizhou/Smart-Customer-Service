@@ -77,7 +77,8 @@ async def list_history_sessions(user_id: str) -> List[Dict]:
     if not uid:
         return []
     try:
-        rows, _ = mysql_store.list_conversations_by_user(uid)
+        # pymysql 是同步阻塞调用，放线程池执行，避免读历史时卡住整个事件循环
+        rows, _ = await asyncio.to_thread(mysql_store.list_conversations_by_user, uid)
     except Exception as e:
         import logging
         logging.getLogger("history").warning(f"读取历史会话失败（降级为空）: {e}")
@@ -111,7 +112,7 @@ async def get_history_messages(user_id: str, session_id: str) -> List[Dict]:
         return []
     scoped_id = scoped_session_id(user_id, session_id)
     try:
-        rows, _ = mysql_store.list_messages(scoped_id)
+        rows, _ = await asyncio.to_thread(mysql_store.list_messages, scoped_id)
     except Exception as e:
         import logging
         logging.getLogger("history").warning(f"读取会话历史失败（降级为空）: {e}")
@@ -134,7 +135,7 @@ async def delete_history_session(user_id: str, session_id: str) -> bool:
     scoped_id = scoped_session_id(user_id, session_id)
     try:
         # 归属校验在 SQL 里（WHERE user_id=%s）：非本用户的会话删除影响 0 行，返回 False
-        deleted = mysql_store.delete_conversation(scoped_id, user_id)
+        deleted = await asyncio.to_thread(mysql_store.delete_conversation, scoped_id, user_id)
     except Exception as e:
         import logging
         logging.getLogger("history").warning(f"删除会话失败: {e}")
@@ -178,12 +179,12 @@ async def close_history_session(user_id: str, session_id: str) -> bool:
     scoped_id = scoped_session_id(user_id, session_id)
     try:
         # 只对「自己名下」的会话生效；从未发过消息的空会话无历史可回看，返回 False
-        conv = mysql_store.get_conversation(scoped_id, user_id)
+        conv = await asyncio.to_thread(mysql_store.get_conversation, scoped_id, user_id)
         if not conv:
             return False
         if conv.get("status") == "closed":
             return True  # 幂等：重复结束同一会话仍算成功
-        return mysql_store.close_conversation(scoped_id, user_id)
+        return await asyncio.to_thread(mysql_store.close_conversation, scoped_id, user_id)
     except Exception as e:
         import logging
         logging.getLogger("history").warning(f"结束会话失败: {e}")

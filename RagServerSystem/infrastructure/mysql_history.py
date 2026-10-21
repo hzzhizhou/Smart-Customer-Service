@@ -9,6 +9,7 @@
   - Redis 只缓存最近 CACHE_WINDOW 条消息（LLM 上下文窗口只用最近 6 条），
     命中则省一次查库，未命中/不可用就回源查库并回填，写缓存失败只记日志。
 """
+import asyncio
 import json
 from datetime import datetime
 from typing import List, Optional
@@ -123,7 +124,7 @@ class MysqlChatHistory(BaseChatHistory):
         except Exception as e:
             log.warning(f"读取历史缓存失败，回源查库: {e}")
 
-        messages = self._db_messages()
+        messages = await asyncio.to_thread(self._db_messages)
         log.debug(f"📖 会话[{self.session_id}] 从 MySQL 读取历史 {len(messages)} 条")
         await self._cache_set(self._trim(messages))
         return messages
@@ -132,13 +133,14 @@ class MysqlChatHistory(BaseChatHistory):
         """【异步】添加消息：先落库（权威），再更新热缓存（失败不影响对话）。"""
         if not isinstance(message, (HumanMessage, AIMessage)):
             raise ValueError(f"仅支持HumanMessage/AIMessage，当前类型：{type(message)}")
-        self._db_append(message)
+        # 落库是同步阻塞调用（pymysql），放线程池执行，避免写历史时卡住事件循环
+        await asyncio.to_thread(self._db_append, message)
         await self._cache_append(message)
 
     async def aclear(self):
         """【异步】清空历史（库 + 缓存）。"""
         try:
-            mysql_store.clear_messages(self.session_id)
+            await asyncio.to_thread(mysql_store.clear_messages, self.session_id)
             from infrastructure.redis.connection import get_redis_async
             client = await get_redis_async()
             await client.delete(self.key)
@@ -165,7 +167,7 @@ class MysqlChatHistory(BaseChatHistory):
             client = await get_redis_async()
             messages = self._parse(await client.get(self.key))
             if messages is None:
-                messages = self._db_tail()
+                messages = await asyncio.to_thread(self._db_tail)
             await client.set(
                 self.key, self._dump(self._trim(messages + [message])),
                 ex=self.expire_seconds,
