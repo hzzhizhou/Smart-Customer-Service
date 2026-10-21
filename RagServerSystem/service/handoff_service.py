@@ -4,7 +4,7 @@
 - 用户主动转人工 → access/routes/handoff.py 的 POST /handoff/request
 - AI 判定投诉后确定性建单 → service/handlers/complaint.py
 """
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from logs.log_config import log
 from infrastructure import mysql_store
@@ -44,8 +44,16 @@ def ensure_handoff_session(user_id: str, question: str = "") -> Tuple[Dict[str, 
     return ticket, False
 
 
-def start_handoff_session(ticket_id: str) -> Dict[str, Any]:
-    """对已存在的工单开启人工会话（AI 自动转人工建单后调用）。"""
+def start_handoff_session(ticket_id: str) -> Optional[Dict[str, Any]]:
+    """对已存在的工单开启人工会话（AI 自动转人工建单后调用）。
+
+    幂等：工单已有消息说明这场人工会话早就开了，不再重复写开场白 ——
+    建单幂等命中「已有工单」后本函数仍会被调用，没有这道检查就会出现
+    同一张工单里躺着两条一样的转接提示。
+    """
+    if mysql_store.list_ticket_messages(ticket_id, limit=1):
+        log.info(f"人工会话已存在，跳过开场白：{ticket_id}")
+        return None
     msg = _write_opening(ticket_id)
     log.info(f"人工会话已开启（AI 转人工）：{ticket_id}")
     return msg

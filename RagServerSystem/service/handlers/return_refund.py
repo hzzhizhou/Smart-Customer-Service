@@ -4,6 +4,7 @@
 栈位收集（Collect）→ 确认（Confirm）→ 执行（Execute）→ 完成（Done）
 由 DST 阶段驱动，避免被 agent 泛化成"查物流/破损鉴定"，且全程不依赖 LLM 工具循环。
 """
+import asyncio
 from typing import AsyncIterator
 
 from logs.log_config import log
@@ -54,7 +55,7 @@ async def _run_mainline(ctx: TurnContext) -> str:
     if dst.stage == Stage.DONE:
         dst.stage = Stage.COLLECTING
         dst.slots = {}
-        ctx.dst_manager.save(dst)
+        await ctx.dst_manager.save(dst)
         return RETURN_ALREADY_DONE.format(subject=subject)
 
     # 0) 快速路径：用户在 CONFIRMING 阶段明确确认办理 → 直接登记，跳过槽位提取 LLM。
@@ -63,24 +64,35 @@ async def _run_mainline(ctx: TurnContext) -> str:
         dst.stage = Stage.EXECUTING
         try:
             # 槽位验证层：统一校验订单归属、存在性与状态可退性（与 DST 状态机解耦）
+            # 校验内部同步查库，放线程池执行
             from agent.dst.order_validator import validate_return_order
-            _check = validate_return_order(dst.slots.get("order_id"), owner_id=user_id)
+            _check = await asyncio.to_thread(
+                validate_return_order, dst.slots.get("order_id"), owner_id=user_id)
             if not _check["valid"]:
                 dst.stage = Stage.COLLECTING
                 dst.slots.pop("order_id", None)  # 清掉无效单号，让用户重新提供
-                ctx.dst_manager.save(dst)
+                await ctx.dst_manager.save(dst)
                 return _check["message"]
             # 幂等防护：同一订单若已有在办的退货/退款工单，不再重复建单
             # （避免 DST 状态被新话题改写后，用户再次确认导致重复落单）
             # 归属限定到当前账号：种子订单号是 mock 数据、被多账号共用，
             # 不加限定会让 B 账号确认时命中 A 账号早先建的工单而误报「已登记」。
             from infrastructure.mysql_store import query_ticket_progress
-            _existing = query_ticket_progress(dst.slots.get("order_id") or "",
-                                             owner=user_id)
-            if _existing and _existing.get("category") in ("return", "refund") \
-                    and _existing.get("status") != "closed":
+            # 同一订单可能同时有退货单/退款单，且最近一张可能是投诉单。
+            # 只查“最近一张”会把早先的退货单漏掉，因此按 return/refund 各查一次取较新者。
+            _category = "return" if intent == "return" else "refund"
+            _existing = None
+            for _cat in ("return", "refund"):
+                _candidate = await asyncio.to_thread(
+                    query_ticket_progress, dst.slots.get("order_id") or "",
+                    owner=user_id, category=_cat)
+                if _candidate and (
+                        _existing is None
+                        or (_candidate.get("created_at") or "") > (_existing.get("created_at") or "")):
+                    _existing = _candidate
+            if _existing and _existing.get("status") != "closed":
                 dst.stage = Stage.DONE
-                ctx.dst_manager.save(dst)
+                await ctx.dst_manager.save(dst)
                 return RETURN_DUPLICATED.format(
                     subject=subject, ticket_id=_existing["ticket_id"])
             from agent.tools.ticket_tool import create_ticket_record
@@ -97,8 +109,8 @@ async def _run_mainline(ctx: TurnContext) -> str:
             _desc = f"{subject}申请（" + "；".join(_parts) + "）" if _parts else f"{subject}申请"
             # 建单即进入阶段化流转的第 1 环节（提交申请，等待商家审核）
             # 分类同时决定轨迹长度：纯退款不退货，轨迹里不出现「寄回商品 / 商家验收」
-            _category = "return" if intent == "return" else "refund"
-            _ticket = create_ticket_record(
+            _ticket = await asyncio.to_thread(
+                create_ticket_record,
                 user_id=user_id or ctx.session_id,
                 order_id=dst.slots.get("order_id", ""),
                 description=_desc,
@@ -129,7 +141,7 @@ async def _run_mainline(ctx: TurnContext) -> str:
         dst.answer = resp
         dst.tool_call_count += 1
         dst.stage = Stage.DONE
-        ctx.dst_manager.save(dst)
+        await ctx.dst_manager.save(dst)
         log.info(f"退货/退款完成 | session={ctx.session_id} | slots={dst.slots} | stage={Stage.DONE}")
         return resp
 
@@ -142,11 +154,12 @@ async def _run_mainline(ctx: TurnContext) -> str:
     _oid = dst.slots.get("order_id")
     if _oid:
         from agent.dst.order_validator import validate_return_order
-        _owner_check = validate_return_order(_oid, owner_id=user_id)
+        _owner_check = await asyncio.to_thread(
+            validate_return_order, _oid, owner_id=user_id)
         if _owner_check["status"] == "forbidden":
             dst.stage = Stage.COLLECTING
             dst.slots.pop("order_id", None)  # 清掉非本人单号，免得下一轮继续复用
-            ctx.dst_manager.save(dst)
+            await ctx.dst_manager.save(dst)
             log.warning(f"退货/退款归属校验拦截 | session={ctx.session_id} | 订单={_oid}")
             return _owner_check["message"]
 
@@ -154,7 +167,7 @@ async def _run_mainline(ctx: TurnContext) -> str:
     missing = [k for k in required_slots(intent) if not dst.slots.get(k)]
     if missing:
         dst.stage = Stage.COLLECTING
-        ctx.dst_manager.save(dst)
+        await ctx.dst_manager.save(dst)
         names = {"order_id": "订单号", "reason": f"{subject}原因"}
         ask = "、".join(names.get(k, k) for k in missing)
         hint = "（请一并告知，便于尽快为您处理）" if "order_id" in missing else ""
@@ -164,7 +177,7 @@ async def _run_mainline(ctx: TurnContext) -> str:
     # 3) 槽位已齐全：进入 CONFIRMING，向用户确认
     if dst.stage != Stage.CONFIRMING:
         dst.stage = Stage.CONFIRMING
-        ctx.dst_manager.save(dst)
+        await ctx.dst_manager.save(dst)
         return RETURN_CONFIRM.format(
             order_id=dst.slots.get("order_id", ""),
             subject=subject,
@@ -173,5 +186,5 @@ async def _run_mainline(ctx: TurnContext) -> str:
 
     # 4) 已在 CONFIRMING 但用户未明确确认（补充/修正了信息）→ 回到 COLLECTING 继续澄清
     dst.stage = Stage.COLLECTING
-    ctx.dst_manager.save(dst)
+    await ctx.dst_manager.save(dst)
     return RETURN_CLARIFY.format(subject=subject)

@@ -4,6 +4,7 @@
 迟迟不调用 create_ticket 导致流式端点超时。这里由意图分类器确定性判定的
 complaint 意图直接落单，保证永不卡死、工单必达。
 """
+import asyncio
 from typing import AsyncIterator
 
 from logs.log_config import log
@@ -35,9 +36,12 @@ async def handle_complaint(ctx: TurnContext) -> AsyncIterator[str]:
         # 幂等：账号下已有未关闭的投诉工单时不再重复建单。转人工后 DST 会一直
         # 复用 complaint 意图，没有这道防护则用户每补一句话就多一张工单
         # （实测「我要投诉…」后再补「订单 SOxxx 有问题」又落一张新单）。
-        open_ticket = query_ticket_progress(user_id, owner=user_id) if user_id else None
-        if open_ticket and open_ticket.get("category") == "complaint" \
-                and open_ticket.get("status") != "closed":
+        # 按 category 收窄：不限定分类时，若最近一张是退货单，这道检查就形同虚设。
+        # 这层是「少建单」的快路径，真正的并发保证在 tickets.idempotency_key 唯一键。
+        open_ticket = await asyncio.to_thread(
+            query_ticket_progress, user_id, owner=user_id,
+            category="complaint") if user_id else None
+        if open_ticket and open_ticket.get("status") != "closed":
             yield TICKET_PROGRESS_NO_NOTE.format(
                 subject=category_cn(open_ticket.get("category")),
                 ticket_id=open_ticket["ticket_id"],
@@ -50,7 +54,9 @@ async def handle_complaint(ctx: TurnContext) -> AsyncIterator[str]:
         description = ctx.question.strip() or "用户投诉，未填写具体描述"
         complaint_order = (ctx.dst.slots.get("order_id", "") if ctx.dst else "") or ""
         # 直接调 create_ticket_record 而非工具：需要拿到工单号来开启人工会话
-        ticket = create_ticket_record(
+        # 建单 + 写开场白都是同步查库，放线程池执行
+        ticket = await asyncio.to_thread(
+            create_ticket_record,
             # 工单归属登录账号：换会话后用户查「我的工单」仍能查到
             user_id=user_id,
             order_id=complaint_order,
@@ -59,8 +65,9 @@ async def handle_complaint(ctx: TurnContext) -> AsyncIterator[str]:
             category="complaint",
         )
         # 写入会话开场白：该工单由此成为一场人工会话，用户端切到人工客服模式
-        start_handoff_session(ticket["ticket_id"])
-        handoff_total.labels("complaint").inc()
+        opening = await asyncio.to_thread(start_handoff_session, ticket["ticket_id"])
+        if opening:
+            handoff_total.labels("complaint").inc()
         yield TICKET_CREATED.format(
             ticket_id=ticket["ticket_id"],
             created_at=ticket["created_at"],

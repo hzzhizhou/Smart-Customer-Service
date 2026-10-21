@@ -1,10 +1,7 @@
-"""确定性订单查询：问题里带订单号且意图为订单/物流，直接查库回传。
-
-背景：模型偶发不吐结构化 tool_calls，而是把 ReAct 轨迹（含它自己编造的
-Observation）当正文输出，被剥离后判定「未产出有效正文」转知识兜底，
-用户看到「没查到可靠的资料」。带单号的查询本身是可确定性完成的动作，
-改由规则直接查库：既保证必达，也保证数据真实（不经模型转述、不会被编造）。
 """
+确定性订单查询：问题里带订单号且意图为订单/物流，直接查库回传。
+"""
+import asyncio
 import re
 from typing import AsyncIterator
 
@@ -19,8 +16,10 @@ async def handle_order_query(ctx: TurnContext) -> AsyncIterator[str]:
         from agent.tools.order_query import query_order as _qo
 
         m = re.search(r"SO\d+", ctx.question)
-        # 带上归属账号：非本账号订单会被归属校验拦下（不返回任何订单字段）
-        resp = _qo.invoke({"order_id": m.group(0), "owner_id": ctx.user["user_id"]})
+        # 只传订单号：归属账号由服务端上下文注入（agent.tools.tool_context），
+        # 调用方不再把身份当参数往下传，这条确定性路径与 Agent 路径口径一致。
+        # 工具内部是同步查库（pymysql），放线程池，避免在事件循环里阻塞其他请求
+        resp = await asyncio.to_thread(_qo.invoke, {"order_id": m.group(0)})
         # 被归属校验拒绝时不再追加拿单建议，避免答复自相矛盾
         yield resp if ORDER_FORBIDDEN in resp else f"{resp}\n\n{ORDER_TAIL}"
     except Exception as e:

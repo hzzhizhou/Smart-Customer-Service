@@ -4,7 +4,7 @@
 
 约定：每个处理器都是异步生成器，入参只有 TurnContext，产出若干文本片段。
 它们只负责「这一轮该回什么」，不负责写历史与推进 DST —— 那是调度方
-（service/turn_service.py 的 AgentTurnService）统一收尾的职责，避免每条分支各写一遍。
+（service/turn/agent_turn.py 的 AgentTurnService）统一收尾的职责，避免每条分支各写一遍。
 """
 from service.handlers.context import TurnContext
 from service.handlers.complaint import handle_complaint

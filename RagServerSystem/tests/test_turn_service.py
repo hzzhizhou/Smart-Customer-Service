@@ -15,7 +15,8 @@ from types import SimpleNamespace
 import pytest
 from langchain_core.documents import Document
 
-import service.turn_service as turn_service
+import service.turn.agent_turn as agent_turn
+import service.turn.rag_turn as rag_turn
 from service.cache import ResponseCache
 from service.handlers import TurnContext
 from service.turn_service import AgentTurnService, RagTurnService, TurnState
@@ -91,7 +92,7 @@ def _agent_turn(question: str, history: _HistoryStub,
 @pytest.fixture(autouse=True)
 def _no_dst(monkeypatch):
     """关闭 DST 更新（本文件不测 DST，只测流式产出与落库）。"""
-    monkeypatch.setattr(turn_service, "DST_ENABLED", False)
+    monkeypatch.setattr(agent_turn, "DST_ENABLED", False)
 
 
 @pytest.fixture(autouse=True)
@@ -107,7 +108,8 @@ def _reset_llm_breaker():
 def history(monkeypatch):
     """init_chat_history 替换为内存桩：RAG 生产者经它落库，断言直接读桩。"""
     stub = _HistoryStub()
-    monkeypatch.setattr(turn_service, "init_chat_history", lambda sid: stub)
+    # init_chat_history 在 RAG 编排模块内被调用，patch 必须打到该模块的全局名
+    monkeypatch.setattr(rag_turn, "init_chat_history", lambda sid: stub)
     return stub
 
 
@@ -118,7 +120,7 @@ def test_agent_exception_midstream_no_duplicate_tail():
     svc = AgentTurnService(
         retrieval_service=None, answer_generator=None,
         unified_agent=_StubAgent(
-            contents=["Final Answer: 您好", "，订单已发货"],
+            contents=["您好，", "订单已发货"],
             error=RuntimeError("LLM 连接中断")),
         intent_classifier=None, dst_manager=None, slot_extractor=None)
     hist = _HistoryStub()
@@ -133,10 +135,10 @@ def test_agent_exception_midstream_no_duplicate_tail():
         return out
 
     pieces = asyncio.run(drive())
-    # 标记后的正文各流一次：您好（含标记后空格）、，订单已发货——没有第三段重复
-    assert pieces == [" 您好", "，订单已发货"]
+    # 正文各流一次：您好，、订单已发货——没有第三段重复
+    assert pieces == ["您好，", "订单已发货"]
     answer = "".join(pieces)
-    assert "您好，订单已发货" in answer
+    assert answer == "您好，订单已发货"
     # 落库一次、内容与流出一致
     assert [type(m).__name__ for m in hist.messages] == ["HumanMessage", "AIMessage"]
     assert hist.messages[1].content == answer
@@ -170,15 +172,15 @@ def _drive_agent(svc, turn):
     return asyncio.run(drive())
 
 
-def test_agent_final_answer_empty_placeholder_replaced():
-    """Final Answer 之后整段是「无相关信息」这类占位答复 → 换兜底话术，不能原样抛给用户。
+def test_agent_empty_placeholder_replaced():
+    """整段正文是「无相关信息」这类占位答复 → 换兜底话术，不能原样抛给用户。
 
     回归防护：模型无据可依时会吐「无相关信息」当正文；此前该段直接透传，
     用户拿到的回答只有四个字（实测 J2「京东上同款 iPhone 15 卖多少钱」）。
     """
     svc = AgentTurnService(
         retrieval_service=None, answer_generator=None,
-        unified_agent=_StubAgent(contents=["Final Answer: ", "无相关信息"]),
+        unified_agent=_StubAgent(contents=["无相关信息"]),
         intent_classifier=None, dst_manager=None, slot_extractor=None)
     hist = _HistoryStub()
     turn = _agent_turn("京东上同款 iPhone 15 卖多少钱", hist, svc.unified_agent)
@@ -188,11 +190,11 @@ def test_agent_final_answer_empty_placeholder_replaced():
     assert "没有查到可靠的资料" in answer
 
 
-def test_agent_final_answer_normal_passes_through():
+def test_agent_normal_answer_passes_through():
     """正常正文（不是空答复候选）必须即时透出，不因缓冲而丢失。"""
     svc = AgentTurnService(
         retrieval_service=None, answer_generator=None,
-        unified_agent=_StubAgent(contents=["Final Answer: ", "iPhone 15 售价 4999 元"]),
+        unified_agent=_StubAgent(contents=["iPhone 15 售价 4999 元"]),
         intent_classifier=None, dst_manager=None, slot_extractor=None)
     hist = _HistoryStub()
     turn = _agent_turn("iPhone 15 多少钱", hist, svc.unified_agent)

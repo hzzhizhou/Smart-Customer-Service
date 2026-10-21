@@ -40,7 +40,7 @@ async def stream_knowledge_answer(retrieval_service, answer_generator,
         use_hyde=False,
         use_multi=False,
         session_id=session_id,
-        auto_filter=True,   # 按问题关键词推断文档类别，先在 metadata 上缩小范围再检索
+        # auto_filter 不在此处指定：统一走 settings.AUTO_FILTER_DEFAULT（PROJECT_AUDIT §4.2(4)）
     )
     if gate_info.get("should_escalate") or not docs:
         log.info(f"知识兜底：检索置信度不足，转人工 | level={gate_info.get('level')}")
