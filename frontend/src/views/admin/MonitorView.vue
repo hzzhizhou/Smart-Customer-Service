@@ -29,6 +29,12 @@
         <el-descriptions-item label="请求总耗时(s)">
           <b>{{ metrics.durationSum.toFixed(2) }}</b>
         </el-descriptions-item>
+        <el-descriptions-item label="LLM 调用次数">
+          <b>{{ metrics.llmRequests }}</b>
+        </el-descriptions-item>
+        <el-descriptions-item label="LLM token 合计">
+          <b>{{ metrics.llmTokens }}</b>
+        </el-descriptions-item>
       </el-descriptions>
     </el-card>
   </div>
@@ -39,7 +45,16 @@ import { ref } from 'vue'
 import http from '@/api'
 
 const health = ref(null)
-const metrics = ref({ requests: 0, durationSum: 0 })
+const metrics = ref({ requests: 0, durationSum: 0, llmRequests: 0, llmTokens: 0 })
+
+// 指标名必须与后端 utils/metrics.py 完全一致（统一 web_agent_ 前缀）；取值用浮点正则，
+// prometheus_client 文本格式里 Counter 也输出 "1.0" 这样的浮点，整数正则会全部漏掉。
+const PATTERNS = {
+  requests: /^web_agent_http_requests_total\{.*\}\s+([\d.eE+-]+)$/,
+  durationSum: /^web_agent_http_request_duration_seconds_sum\{.*\}\s+([\d.eE+-]+)$/,
+  llmRequests: /^web_agent_llm_requests_total\{.*\}\s+([\d.eE+-]+)$/,
+  llmTokens: /^web_agent_llm_tokens_total\{.*\}\s+([\d.eE+-]+)$/,
+}
 
 async function load() {
   try {
@@ -50,15 +65,14 @@ async function load() {
   }
   try {
     const m = await http.get('/metrics', { responseType: 'text' })
-    let requests = 0
-    let durationSum = 0
+    const sum = { requests: 0, durationSum: 0, llmRequests: 0, llmTokens: 0 }
     for (const line of m.data.split('\n')) {
-      const rm = line.match(/^http_requests_total\{(.*?)\}\s+(\d+)$/)
-      if (rm) requests += Number(rm[2])
-      const sm = line.match(/^http_request_duration_seconds_sum\{(.*?)\}\s+([\d.eE+-]+)$/)
-      if (sm) durationSum += Number(sm[2])
+      for (const [key, re] of Object.entries(PATTERNS)) {
+        const hit = line.match(re)
+        if (hit) sum[key] += Number(hit[1])
+      }
     }
-    metrics.value = { requests, durationSum }
+    metrics.value = sum
   } catch (e) {
     /* metrics 读取失败忽略 */
   }

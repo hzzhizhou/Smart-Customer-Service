@@ -33,7 +33,6 @@
               登录
             </el-button>
             <p class="tip">还没有账号？<el-link type="primary" @click="tab = 'register'">立即注册</el-link></p>
-            <p class="tip muted">演示管理员：admin / admin123</p>
           </el-form>
         </el-tab-pane>
 
