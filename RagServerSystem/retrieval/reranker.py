@@ -65,6 +65,25 @@ class CrossEncoderReranker:
                 return False
         return True
 
+    async def warmup(self) -> bool:
+        """启动预热：提前加载模型并跑一次小推理。
+
+        懒加载的代价实测约 18s（278M 权重加载 + torch 首次推理的惰性初始化），
+        若不预热会全部落在重启后的第一个用户请求上（首字延迟 25s+，
+        前端长时间转圈像"没反应"）。启动后在后台跑这里预热；
+        预热完成前若有请求进来，rerank 会经 _load_lock 等待同一份加载结果。
+        """
+        if not await self._ensure_model():
+            return False
+        # 单对小样本推理：把 torch 首次推理的惰性开销（kernel 选择/内存池）
+        # 也一并热掉，否则这部分仍会留在首个真实请求里
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(None, self._model.predict, [("预热", "模型")])
+        except Exception as e:
+            log.warning(f"Cross-Encoder 预热推理失败（不影响后续正常使用）: {e}")
+        return True
+
     async def rerank(self, docs: List[Document], query: str) -> List[Document]:
         """按 query 与文档的相关性精排，返回 top_n 个文档。
 
