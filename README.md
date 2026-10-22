@@ -10,9 +10,10 @@
 | --- | --- |
 | HTTP / WebSocket 端点 | 35 |
 | Agent 工具 | 5 |
-| 单元测试 | 339 个全部通过（约 22s） |
+| 单元测试 | 350 个全部通过（约 14s） |
 | 知识库语料 | 10 个文件（8 篇文档 + 2 份表格） |
 | 评测集 | 意图 81 条 · RAGAS 30 题 · 业务端到端 53 题 |
+| 并发压测（10 并发 × 40 请求） | P50 40.9s · P95 47.6s · P99 48.4s · 0 失败 |
 
 ## 目录
 
@@ -85,7 +86,7 @@
 | 缓存 | Redis：会话历史热缓存，不可用时回源 MySQL（fail-open） |
 | 可观测 | Prometheus 指标、Grafana 看板、请求级 trace、工具调用审计 |
 | 前端 | Vue 3（script setup）、Element Plus、Vue Router、Pinia、Vite |
-| 测试 | pytest（339 个用例） |
+| 测试 | pytest（350 个用例） |
 
 ## 4. 快速开始
 
@@ -273,14 +274,53 @@ AI大模型与智能体开发/
 ```powershell
 cd RagServerSystem
 
-python -m pytest tests -q          # 单测：339 passed
+python -m pytest tests -q          # 单测：350 passed
 python intent_eval.py rule         # 意图规则层评测：81 条，秒级、零 LLM 费用
 python intent_calibration.py       # 置信度校准：可靠性表 + ECE + 阈值扫描
 python verify_dataset.py           # 离线检索命中验证（不带参数不会改数据）
 python e2e_online_test.py          # 在线端到端 S0-S5，需服务在 8000 运行
 python e2e_business_eval.py        # 业务评测集 53 题，需服务在 8000 运行
 python -m evaluation.service       # RAGAS 双臂对比（开 / 关重排），30 题
+python benchmark.py -c 10 -n 40    # 并发压测：/agent/stream 全链路，P50/P95/P99
 ```
+
+### 8.1 RAGAS 双臂对比：重排的价值
+
+同一 30 题分别关闭 / 开启重排各跑一遍 RAGAS，其余链路完全一致（实测结果）：
+
+| 指标 | 关闭重排 | 开启重排 | 差值 |
+| --- | --- | --- | --- |
+| context_precision | 0.6867 | 0.8933 | **+0.207（+30%）** |
+| context_recall | 0.6200 | 0.7667 | **+0.147（+24%）** |
+| faithfulness | 0.6209 | 0.6277 | +0.007 |
+| answer_relevancy | 0.7254 | 0.7229 | -0.003 |
+| 平均单题检索耗时 | 0.21s | 4.38s | +4.17s |
+| 无答案题子集 faithfulness | 0.3659 | 0.4338 | 两臂都在编 |
+
+- 重排的价值钉在**检索层**：precision +30%、recall +24%；生成端指标基本饱和，重排不动它们。
+- 无答案题两臂都低——该拒答时仍在编答案，**拒答门控是两臂共同的短板**，重排解决不了。
+- 口径备注：判分模型与生成模型同为 deepseek-chat（同源判分，绝对分数仅参考、两臂差值有效）；
+  判分送检索前 3 条，生成用全部 5 条候选，两臂口径一致。
+
+### 8.2 并发压测
+
+`python benchmark.py -c 10 -n 40`：10 并发 × 40 请求打 `/agent/stream` 全链路
+（意图 → 检索 → 重排 → LLM 流式生成），每请求独立 session，知识类问句轮转，
+本机实测（CPU 重排 + DeepSeek 生成）：
+
+| 指标 | 数值 |
+| --- | --- |
+| 成功 / 失败 | 40 / 0 |
+| P50 | 40.9s |
+| P95 | 47.6s |
+| P99 | 48.4s |
+| MIN / MAX / MEAN | 26.4s / 48.4s / 40.2s |
+| 吞吐 | 0.24 req/s |
+
+单并发基线 P50 约 6.5s（其中重排约 4.2s）；10 并发下 P50 抬至 40.9s，吞吐
+0.24 req/s ≈ 1 / 4.2s，墙钟 166s ≈ 40 题 × 4.2s 的重排串行总工时——瓶颈被钉在
+CPU 重排单点（并发下事实串行），LLM 生成（API 并发）被排队完全掩盖。
+全程无超时、无失败、无雪崩；生产优化路径明确：GPU 重排、独立重排服务、或批量重排。
 
 评测口径、各项指标的实测结果与已知偏差见 [设计说明](RagServerSystem/docs/design-notes.md#9-评测口径)。
 
@@ -299,10 +339,10 @@ python -m evaluation.service       # RAGAS 双臂对比（开 / 关重排），3
 
 - 订单、工单、用户为自建 MySQL 表的 **mock 数据**，未对接真实 ERP / OMS。
 - Chroma 为单机向量库，生产建议迁移 Milvus / Elasticsearch。
-- 单进程 uvicorn，未配置多 worker 与压测指标；内存限流与缓存不跨实例共享。
+- 单进程 uvicorn，未配置多 worker；10 并发压测与瓶颈分析见 [§8.2](#82-并发压测)，内存限流与缓存不跨实例共享。
 - 业务库（pymysql）与文档状态库（aiomysql）两套驱动并存，未统一连接池。
 - 本地模型路径为绝对路径，换机器需修改 `config/settings.py`。
-- CPU 环境下 Cross-Encoder 重排约 11s/题（首次加载 20~25s），可用 `RERANK_MODE=none` 临时关闭。
+- CPU 环境下 Cross-Encoder 重排约 4s/题（20 候选真实分块；首次加载 20~25s），可用 `RERANK_MODE=none` 临时关闭。
 - 门控阈值与意图词表依赖评测集持续回归；逗号分隔的多问题不会被拆分。
 - `combined_splitter` 未作默认：当前语料较短，父子分层会退化为重复存储。
 
