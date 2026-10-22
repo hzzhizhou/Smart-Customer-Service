@@ -153,28 +153,3 @@ class Bm25Retriever(BaseRetriever):
         except Exception as e:
             log.error(f"异步BM25检索失败: {e}", exc_info=True)
             raise
-if __name__ =='__main__':
-    # 实例化时自定义阈值（覆盖全局配置）
-    bm25_retriever = Bm25Retriever(
-        vector_store=ChromaVector(),
-        k=10,
-        score_threshold=0.2 # 仅返回分数≥0.2的文档
-    )
-
-    # 同步检索
-    # docs = bm25_retriever.invoke("大模型私有化部署")
-    questions = [
-        "大模型私有化部署",
-        "RAG"
-    ]
-    # ✅ 正确打印每一条的分数
-    # print("=== 检索结果分数 ===")
-    init_thread_pools()
-    async def async_retrieve():
-        tasks = [ bm25_retriever.ainvoke(q) for q in questions]
-        result =await asyncio.gather(*tasks)
-        return result
-    result =  asyncio.run(async_retrieve())
-    # for i, doc in enumerate(result[1]):
-    #     print(f"第{i+1}条 | 分数：{doc.metadata['bm25_score']:.4f}")
-    # # 异步检索
