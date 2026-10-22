@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from config.settings import API_HOST, API_PORT, RESPONSE_TIMEOUT, ENABLE_API_DOCS
 from logs.log_config import log
 from agent.service import create_unified_agent
+from utils.llm_factory import create_llm
 from access.middleware import RateLimiter, register_middleware, register_request_context_middleware
 from shared.schemas import AgentRequest, RAGRequest
 from access.routes.auth import require_admin, require_user
@@ -98,11 +99,12 @@ class RAGService:
             # 统一 Agent：复用 RetrievalService（含路由/rerank/置信度门控）
             unified_agent=create_unified_agent(retrieval_service, llm),
             # 细粒度业务意图分类器：识别退货/退款/物流/投诉等子意图，引导 Agent 优先选工具
-            intent_classifier=IntentClassifier(llm=llm),
+            # （意图 LLM 兜底为纯文本管道，用带供应商降级的独立实例，与 Agent 的 bind_tools 实例解耦）
+            intent_classifier=IntentClassifier(llm=create_llm(streaming=False, with_fallback=True)),
             # DST：跨轮会话状态管理（意图/槽位/阶段持久化）
             dst_manager=DSTManager(),
-            # 槽位提取器：LLM 从用户发言中抽取本轮增量槽位
-            slot_extractor=SlotExtractor(llm=llm) if llm else None,
+            # 槽位提取器：LLM 从用户发言中抽取本轮增量槽位（同样走供应商降级实例）
+            slot_extractor=SlotExtractor(llm=create_llm(streaming=False, with_fallback=True)),
         )
 
         self._register_routes()

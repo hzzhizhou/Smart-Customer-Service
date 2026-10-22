@@ -49,9 +49,13 @@ def main():
     atexit.register(shutdown_thread_pools)
     vector_store = ChromaVector()
     chat_history = init_chat_history(session_id=SESSION_ID)
+    # 双实例分流：Agent 工具链必须用原始 ChatOpenAI（bind_tools），
+    # 其余纯文本链路（查询改写/生成/意图/槽位）用带供应商降级的实例：
+    # 主 DeepSeek 失败自动切备用通义，两道全挂才触发熔断兜底话术。
     llm = create_llm(streaming=True)
-    retrieval_service = RetrievalService(vector_store, llm, chat_history)
-    answer_generator = AnswerGenerator(llm)
+    text_llm = create_llm(streaming=True, with_fallback=True)
+    retrieval_service = RetrievalService(vector_store, text_llm, chat_history)
+    answer_generator = AnswerGenerator(text_llm)
     service = RAGService(retrieval_service, answer_generator,llm)
     # 重排模型预热：与 RAGService 装配/端口监听并行进行，启动后即处于"热"状态
     _warmup_reranker(retrieval_service)

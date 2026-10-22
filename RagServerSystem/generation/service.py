@@ -24,7 +24,7 @@ import time
 
 class AnswerGenerator:
     def __init__(self, llm: Optional[Any] = None):
-        self.llm = llm or create_llm(streaming=True)
+        self.llm = llm or create_llm(streaming=True, with_fallback=True)
         self.base_prompt = ChatPromptTemplate.from_messages([
             ("system", """你是智能售后客服，正在跟顾客对话。严格遵守以下要求：
 

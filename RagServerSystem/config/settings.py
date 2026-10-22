@@ -14,26 +14,41 @@ load_dotenv(BASE_DIR / ".env")
 VECTOR_DB_DIR = BASE_DIR / "vector_db-sql"   # 向量库存储目录
 STOP_WORDS = BASE_DIR / "config"/"stop_words.txt"
 
-# LLM/嵌入模型配置（企业级版本锁定）
-LLM_MODEL = "deepseek-v4.1-flash"#换更快的模型：qwen-turbo 比 qwen3-max 快很多，效果差异不大。
+# ====================== 嵌入模型配置（固定通义） ======================
+# DeepSeek 等供应商无 embedding 接口，向量嵌入统一走通义（云端约0.5s，本地CPU bge-base 20s+）
+EMBEDDING_BACKEND = "dashscope"    # "dashscope" 或 "local"
+# 本地嵌入模型路径：优先环境变量注入，缺省按项目根 models/ 目录解析
+LOCAL_EMBEDDING_MODEL = os.getenv("LOCAL_EMBEDDING_MODEL") or str(
+    BASE_DIR.parent / "models" / "bge-base-zh-v1.5")  # 768 维
+# 云端模型（仅当 EMBEDDING_BACKEND="dashscope" 时使用）
+DASHSCOPE_EMBEDDING_MODEL = "qwen3.7-text-embedding-flash"  # 1024维
+DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")  # 从 .env 读取
+
+# ====================== LLM 生成链路（供应商可切换） ======================
+# 模型/端点/key 全部从 .env 注入，换供应商（DeepSeek/GLM/SiliconFlow 等任意
+# OpenAI 兼容端点）只改 .env 不动代码（工厂函数见 utils/llm_factory.py）。
+# 以下缺省值是「.env 缺失时的防崩兜底」，端点与模型必须配套（通义兼容端点 +
+# qwen3.7-flash），切勿只改其一。
+LLM_MODEL = os.getenv("LLM_MODEL", "qwen3.7-flash-2026-07-15")
+LLM_BASE_URL = os.getenv("LLM_BASE_URL","https://dashscope.aliyuncs.com/compatible-mode/v1")
+# 生成链路专用 key：与 DASHSCOPE_API_KEY 分离（后者被 DashScopeEmbeddings 占用），
+# 两家供应商混用时互不干扰；缺省回退通义 key，保持单供应商部署零配置。
+LLM_API_KEY = os.getenv("LLM_API_KEY") or DASHSCOPE_API_KEY
 LLM_TEMPERATURE = 0.01  # 无幻觉：固定温度
-LLM_SEED = 42        # 固定随机种子（结果稳定）
+LLM_SEED = 42            # 固定随机种子（结果稳定）
 # 单次 LLM 调用超时（秒）。流式下该值即「两个 chunk 之间的读超时」：
 # 模型挂住不出字时抛异常，由生成层/Agent 的兜底话术接住，避免一轮请求无限期占住连接。
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "30"))
 
-# ====================== 嵌入模型配置 ======================
-EMBEDDING_BACKEND = "dashscope"    # "dashscope" 或 "local"（云端约0.5s，本地CPU bge-base 20s+）
-# LOCAL_EMBEDDING_MODEL = "D:/RAG-Windows/AI大模型与智能体开发/models/bge-small-zh-v1.5"#---512维
-LOCAL_EMBEDDING_MODEL = "D:/RAG-Windows/AI大模型与智能体开发/models/bge-base-zh-v1.5"#--768维,本地下载的模型地址
-# 云端模型（仅当 EMBEDDING_BACKEND="dashscope" 时使用）
-DASHSCOPE_EMBEDDING_MODEL = "qwen3.7-text-embedding-flash"# 1024维
-DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")  # 从.env读取
-
-# ====================== LLM OpenAI 兼容模式 ======================
-# 统一改用 DashScope 的 OpenAI 兼容端点（compatible-mode）。key、模型均为通义账号，仅调用协议不同。
-# LLM 工厂函数见 utils/llm_factory.py（config 仅保留纯配置，不含运行时逻辑）
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+# ---------- 备用 LLM（第二供应商容灾） ----------
+# 主链路失败（超时/限流/额度耗尽）时自动切备用端点重试，两道全挂才走兜底话术。
+# 仅 with_fallback=True 的链路生效（生成/意图/槽位提取；Agent 的 bind_tools 不兼容
+# RunnableWithFallbacks 包装，走自己的失败兜底话术）。缺省回退通义兼容端点 +
+# qwen3.7-flash，与切换后的主链路形成异源容灾；通义 chat 额度与 embedding 额度
+# 按模型独立计量，主链路额度耗尽不影响这里可用。
+LLM_FALLBACK_MODEL = os.getenv("LLM_FALLBACK_MODEL", "qwen3.7-flash-2026-07-15")
+LLM_FALLBACK_BASE_URL = os.getenv("LLM_FALLBACK_BASE_URL","https://dashscope.aliyuncs.com/compatible-mode/v1")
+LLM_FALLBACK_API_KEY = os.getenv("LLM_FALLBACK_API_KEY") or DASHSCOPE_API_KEY
 
 # 数据层配置
 CHUNK_SIZE = 768               # 分块大小（适配LLM上下文）
@@ -59,7 +74,7 @@ AUTO_FILTER_DEFAULT = os.getenv("AUTO_FILTER", "true").lower() != "false"
 
 # ====================== 分块策略配置 ======================
 CHUNKING_STRATEGY = "recursive"  # 可选: recursive, semantic, sliding_window, parent_child, combined_splitter
-SEMANTIC_EMBEDDING_MODEL = "D:/RAG-Windows/AI大模型与智能体开发/models/bge-base-zh-v1.5"#--768维
+SEMANTIC_EMBEDDING_MODEL = os.getenv("SEMANTIC_EMBEDDING_MODEL") or LOCAL_EMBEDDING_MODEL  # 语义分块复用本地嵌入模型
 SEMANTIC_CHUNK_THRESHOLD = 0.75   # 句子相似度阈值（低于则切分）
 SEMANTIC_BUFFER_SIZE = 2           # 切分时前后保留的句子数
 

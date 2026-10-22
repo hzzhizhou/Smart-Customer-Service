@@ -69,7 +69,7 @@ SLOT_EXTRACT_SYSTEM = """你是一个电商客服的槽位提取器。从用户�
 
 class SlotExtractor:
     def __init__(self, llm=None):
-        self.llm = llm or create_llm(streaming=False)
+        self.llm = llm or create_llm(streaming=False, with_fallback=True)
         self._chain = self._init_chain()
 
     def _init_chain(self):

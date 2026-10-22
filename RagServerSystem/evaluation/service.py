@@ -5,6 +5,7 @@
 import argparse
 import asyncio
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -45,18 +46,13 @@ EVAL_SET_PATH = BASE_DIR / "evaluation" / "eval_set.json"
 METRIC_NAMES = ["faithfulness", "answer_relevancy", "context_precision", "context_recall"]
 # 判分并发：单题内四个指标会一起进这个池子，4 与 DashScope 的限流比较匹配
 JUDGE_MAX_WORKERS = 4
-# 判分模型：与生成模型异源，避免同源模型给自己打高分的自我偏好偏差
-JUDGE_MODEL = "qwen3.8-max"
+JUDGE_MODEL = os.getenv("JUDGE_MODEL", "deepseek-v4.1-flash")
 # 判分温度：判分是分类任务，要的是确定性而非发散。1.0 只是当初给「只接受 1.0 的
 # kimi-k3」留的兼容值；已实测 qwen3.8-max 接受 0.01，故改回 0.01 压掉判分抖动。
 JUDGE_TEMPERATURE = 0.01
 # 判分随机种子：与温度一起固定，让同一份输入重跑得到同样的分（实验可复现）
 JUDGE_SEED = 42
-# 送进 RAGAS 的 context 条数上限 —— 这是判分 token 的最大开关：
-#   context_precision 会对**每一条** context 单独发一次「是否与问题相关」的判断，
-#   faithfulness 的输入也随 context 总量变长。检索返回 5 条时判 5 次，截到 3 条就只判 3 次。
-# 代价：context_precision / context_recall 的口径变成「前 3 条的精度/召回」，
-#   而这恰好是重排最该体现出差异的地方（把相关文档顶到前面），与本实验目的同向。
+# 送判 context 上限：判分只看检索前 3 条（省 token 口径，双臂一致，历史口径不变）
 JUDGE_CONTEXT_TOP_K = 3
 
 
