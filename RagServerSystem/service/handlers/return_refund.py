@@ -179,7 +179,11 @@ async def _run_mainline(ctx: TurnContext) -> str:
             return _check["message"]
 
     # 2) COLLECTING：必要槽位缺失 → 礼貌补齐提问
+    # required_slots 返回 set（迭代序不稳定），追问顺序跨进程会随机翻转
+    # （实测同一句追问出现过「订单号、退货原因」和「退货原因、订单号」两种），固定展示顺序。
+    _ask_order = {"order_id": 0, "reason": 1}
     missing = [k for k in required_slots(intent) if not dst.slots.get(k)]
+    missing.sort(key=lambda k: _ask_order.get(k, 99))
     if missing:
         dst.stage = Stage.COLLECTING
         await ctx.dst_manager.save(dst)
