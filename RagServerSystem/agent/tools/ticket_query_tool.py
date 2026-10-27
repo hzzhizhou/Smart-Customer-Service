@@ -85,7 +85,7 @@ def query_ticket(order_id: str = "", category: str = "") -> str:
       进度时传入，避免「先建退货单、后建投诉单」时把投诉单当成退货进度返回。
     - 输出：最近一张工单的处理进度（阶段化售后为完整环节说明 + 人工客服答复回传）
     """
-    # 身份只认服务端登录态：工具参数里已无账号字段，模型无从伪造（PROJECT_AUDIT P0-3）
+    # 身份只认服务端登录态：工具参数里已无账号字段，模型无从伪造
     owner = current_user_id()
     if not owner:
         log.warning("query_ticket 缺少登录账号，拒绝查询")

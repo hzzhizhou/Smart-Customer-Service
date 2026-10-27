@@ -171,7 +171,7 @@
 
 | 工具 | 数据 | 说明 |
 | --- | --- | --- |
-| `pytest tests -q` | 339 例 | 单测，核心纯逻辑；历史持久化用例真连 MySQL，连不上自动 skip |
+| `pytest tests -q` | 363 例 | 单测，核心纯逻辑；历史持久化用例真连 MySQL，连不上自动 skip |
 | `intent_eval.py rule` | 81 条 | 规则层准确率，秒级、零 LLM 费用 |
 | `intent_eval.py` | 81 条 | 追加 hybrid 模式，输出兜底救回 / 改错明细 |
 | `intent_calibration.py` | 81 条 | 可靠性表、ECE、兜底阈值扫描 |
@@ -202,19 +202,35 @@
 
 ### 10.2 轮次编排
 
-拆分前的 `service/turn_service.py`（以仓库 HEAD 版本计约 730 行）按职责拆为四个模块，
+拆分前的 `service/turn_service.py`（以仓库 HEAD 版本计约 730 行）按职责拆为五个模块，
 原文件退化为纯 re-export 的 facade：
 
 | 模块 | 内容 |
 | --- | --- |
 | `turn/streaming.py` | `_TTFTRecorder`、`_StreamQueue`、`_spawn_producer`、历史读写与收尾落库 |
 | `turn/state.py` | `TurnState`、`_summarize_value`、`_redact_args`、`_result_digest` |
-| `turn/agent_turn.py` | `AgentTurnService`：历史窗口、意图注入、分支调度、Agent 流式解析、工具审计、DST 更新 |
+| `turn/graph.py` | LangGraph 编排：`classify` 意图节点、`route_turn` 优先级表、条件边分派七个分支节点 |
+| `turn/agent_turn.py` | `AgentTurnService`：历史窗口、图节点执行器（意图/handler/Agent）、流式解析、工具审计、DST 更新 |
 | `turn/rag_turn.py` | `RagTurnService`：无状态检索问答、响应缓存、`_gate_headers` |
 
 调用方仍从 `service.turn_service` 导入，拆分对上层无感。测试若要 patch `DST_ENABLED`、
 `init_chat_history` 等模块级对象，必须指向 `service.turn.agent_turn` / `service.turn.rag_turn`，
 patch facade 不生效。
+
+#### 为什么主链路不挂 checkpointer
+
+图是无状态的：`TurnGraphState` 只承载本轮运行时对象（`ctx`、`turn`、流式队列、已产出片段），
+不跨轮、不序列化。跨轮业务状态（`intent / slots / stage`）仍由 `DSTManager` 落 MySQL
+`conversation_state` 表，是唯一权威源。
+
+- 本轮是「单步短事务」：`START → classify → 命中分支 → END`，没有中间步骤需要断点恢复；
+- 没有 `interrupt/resume`、HITL 审批、时间旅行回放需求；
+- 若挂 checkpointer，`messages`、意图、槽位会与 chat history / DST 表重复，形成第三份状态源，
+  且图版本与业务状态耦合、回放可能复活旧业务事实。
+
+引入前提（满足任一再考虑）：出现需要人工中断后恢复的长流程、跨步骤图执行、或回放调试需求。
+届时优先官方 `langgraph-checkpoint-postgres`，或把 `conversation_state` 表适配成 checkpointer，
+而不是把整个 DST 对象塞进图状态。
 
 ### 10.3 存储层
 

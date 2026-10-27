@@ -32,8 +32,6 @@ def build_search_knowledge(retrieval_service: RetrievalService):
                 use_context=False,   # Agent 模式下不使用对话历史改写（历史已在 Agent 层拼接）
                 use_hyde=False,
                 use_multi=False,
-                # auto_filter 不在此处指定：走 settings.AUTO_FILTER_DEFAULT 的全局统一策略，
-                # 避免 Agent 入口与 /rag/stream 入口的召回范围悄悄不一致（PROJECT_AUDIT §4.2(4)）
             )
         if not docs:
             return "未找到相关信息。建议调用 create_ticket 转人工处理。"

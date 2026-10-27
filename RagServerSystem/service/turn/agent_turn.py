@@ -1,9 +1,7 @@
-"""Agent 一轮问答的编排：读历史 → 识别意图 → 选确定性分支 → 产出 → 收尾。
-
-与 RAG 链路的差异：这里有历史窗口、意图注入、DST 跨轮状态、确定性 handler 调度与 ReAct 兜底。
+"""Agent 一轮问答的编排：读历史 → 图内意图识别与路由 → 分支执行 → 收尾。
+classify 意图节点 → route_turn 条件边 → 业务分支 / Agent 兜底；
 """
 import asyncio
-import re
 import time
 from typing import Any, Dict, List, Optional
 
@@ -17,10 +15,8 @@ from logs.log_config import log
 from shared.constants import (
     MAINLINE_SWITCH_HINTS,
     MAINLINE_SWITCH_SCORE,
-    PROGRESS_KEYWORDS,
     could_be_empty_answer,
     is_empty_answer,
-    is_my_orders_query,
 )
 from shared.reply_templates import (
     AGENT_NO_ANSWER_FALLBACK,
@@ -48,6 +44,7 @@ from utils.metrics import (
 )
 from utils.request_context import get_request_id, get_trace_id, span
 
+from .graph import build_turn_graph, route_turn
 from .state import TurnState, _redact_args, _result_digest, _summarize_value
 from .streaming import (
     _StreamQueue,
@@ -89,14 +86,16 @@ class AgentTurnService:
     # ---------- 准备阶段 ----------
     async def _prepare(self, question: str, session_id: str,
                        user: Dict[str, Any]) -> TurnState:
-        """取历史窗口 → 加载 DST → 注入业务意图，组装成一轮的上下文。"""
+        """取历史窗口 → 加载 DST，组装成一轮的上下文。
+
+        意图识别已移入图 classify 节点（见 _run_classify_node）：路由判定的输入
+        就是 classify 的产出，时序上必须先识别后路由。
+        """
         chat_history = init_chat_history(session_id)
         history_msgs = await load_chat_history(chat_history)
         messages = self._build_messages(history_msgs, question)
         # DST：加载跨轮会话状态，注入已收集槽位/待补项
         dst = await self.dst_manager.load(session_id) if DST_ENABLED else None
-        messages, intent_info = await self._enrich_messages_with_intent(
-            messages, question, dst=dst, user_id=user["user_id"])
         return TurnState(
             ctx=TurnContext(
                 retrieval_service=self.retrieval_service,
@@ -107,7 +106,8 @@ class AgentTurnService:
                 session_id=session_id,
                 user=user,
                 dst=dst,
-                intent_info=intent_info,
+                # 由图 classify 节点回填（未配置意图分类器时保留预置值）
+                intent_info={},
             ),
             messages=messages,
             chat_history=chat_history,
@@ -200,68 +200,70 @@ class AgentTurnService:
         # system 指令插到消息列表最前；同时把识别到的意图返回给上层（用于确定性动作决策）
         return [("system", prompt)] + messages, intent_info
 
-    # ---------- 确定性分支调度 ----------
-    @staticmethod
-    def _pick_handler(ctx: TurnContext):
-        """挑选本轮要走的确定性分支，返回 (处理器, 该分支应计入的工具调用次数)。
+    # ---------- LangGraph 编排 ----------
+    def _build_turn_graph(self):
+        """把意图节点 + 六条确定性分支 + Agent 兜底注册成图节点；节点名即分支指标/审计标签。"""
 
-        判定顺序即业务优先级（与拆分前完全一致）：投诉 → 工单进度 → 带单号订单查询
-        → 我名下订单 → 退货/退款 → 知识咨询；都不命中则返回 (None, 0)，交给 Agent 泛化处理。
+        def handler_node(handler, dst_tool_count: int):
+            branch = handler.__name__.removeprefix("handle_")
+
+            async def node(state):
+                return await self._run_handler_node(
+                    state, handler, dst_tool_count, branch)
+            return node
+
+        return build_turn_graph({
+            # 意图节点：整轮第一步，识别结果驱动条件路由
+            "classify": self._run_classify_node,
+            # 建单相当于调了一次工具，用于推进 DST 阶段
+            "complaint": handler_node(handle_complaint, 1),
+            "ticket_progress": handler_node(handle_ticket_progress, 0),
+            "order_query": handler_node(handle_order_query, 0),
+            "my_orders": handler_node(handle_my_orders, 0),
+            "return_refund": handler_node(handle_return_refund, 0),
+            "consult": handler_node(handle_consult, 0),
+            "agent": self._run_agent_node,
+        })
+
+    async def _run_classify_node(self, state) -> dict:
+        """意图节点：DST 主线融合 → 规则/LLM 两级级联识别 → 判定分支。
+
+        识别结果回填 ctx.intent_info（下游提示词与路由共用），system 意图指令
+        同时注入 turn.messages；路由结果写入 state["branch"]，条件边只读不重算。
+        意图分类器未配置时（测试降级路径）保留预置意图，但 branch 仍必须写入。
         """
-        question = ctx.question
-        intent = (ctx.intent_info or {}).get("intent")
-        # 本轮若在问「工单/处理进度」就不判投诉建单：用户提交投诉后 dst 会一直复用
-        # complaint 主线意图，先判投诉就会「每问一次进度就多一张工单」（实测连问两次生成两张）。
-        progress_hit = any(k in question for k in PROGRESS_KEYWORDS)
-        if intent == "complaint" and not progress_hit:
-            return handle_complaint, 1     # 建单相当于调了一次工具，用于推进 DST 阶段
-        if progress_hit:
-            return handle_ticket_progress, 0
-        if re.search(r"SO\d+", question) and intent in ("order", "logistics"):
-            return handle_order_query, 0
-        if is_my_orders_query(question):
-            return handle_my_orders, 0
-        # 退货/退款以「融合后的主线意图」为准（跨轮保持 return/refund 不被 qwen 冲掉）
-        main_intent = (ctx.dst.intent if (ctx.dst is not None and DST_ENABLED)
-                       else (intent or ""))
-        if (DST_ENABLED and ctx.dst is not None and ctx.slot_extractor is not None
-                and main_intent in ("return", "refund")):
-            return handle_return_refund, 0
-        if intent == "consult":
-            return handle_consult, 0
-        return None, 0
+        turn: TurnState = state["turn"]
+        if self.intent_classifier is not None:
+            messages, intent_info = await self._enrich_messages_with_intent(
+                turn.messages, turn.ctx.question, dst=turn.ctx.dst,
+                user_id=turn.ctx.user.get("user_id", ""))
+            turn.messages = messages
+            turn.ctx.intent_info = intent_info
+        else:
+            intent_info = turn.ctx.intent_info or {}
+        branch = route_turn(turn.ctx, state.get("dst_enabled", DST_ENABLED))
+        return {
+            "intent": intent_info.get("intent", ""),
+            "confidence": intent_info.get("confidence", 0.0),
+            "branch": branch,
+        }
 
-    # ---------- 产出阶段 ----------
-    async def _produce(self, turn: TurnState, queue: asyncio.Queue):
-        """（独立任务）生成完整答复：逐段写入队列供下游转发，结束时直接落库。"""
-        final_text: List[str] = []
-        # 身份注入点（PROJECT_AUDIT P0-3）：工具读的是服务端上下文，不是 LLM 填的参数。
-        # 必须在这里 set —— 本方法是独立任务，其上下文在任务创建时复制，父任务里 set 不会
-        # 追溯生效；set 在本任务内则天然按「一轮 = 一个任务」隔离，且随任务结束一起销毁。
-        user_token = set_current_user(turn.ctx.user.get("user_id", ""))
-        try:
-            # 一轮的根 span：覆盖确定性 handler / Agent 兜底；其内再嵌 intent/retrieve/llm/tool
-            with span("agent.turn", kind="internal"):
-                handler, dst_tool_count = await self._dispatch(turn, queue, final_text)
-                if handler is None:
-                    # ========== 泛化 ReAct 兜底：确定性分支都不命中时交给 Agent ==========
-                    await self._produce_agent(turn, queue, final_text)
-        finally:
-            reset_current_user(user_token)
+    def _get_turn_graph(self):
+        """懒加载并缓存编译后的图（object.__new__ 构造的测试桩同样可用）。"""
+        graph = getattr(self, "_turn_graph", None)
+        if graph is None:
+            graph = self._build_turn_graph()
+            self._turn_graph = graph
+        return graph
 
-    async def _dispatch(self, turn: TurnState, queue: asyncio.Queue,
-                        final_text: List[str]):
-        """确定性分支调度：命中处理器就走处理器，否则返回 (None, 0) 交给 Agent 兜底。"""
-        # 处理器只负责「这一轮回什么」，写历史与推进 DST 统一在这里收尾
-        handler, dst_tool_count = self._pick_handler(turn.ctx)
-        # 分支分布指标：确定性分支取其处理器名（去掉 handle_ 前缀），
-        # 都不命中记为 agent（泛化 ReAct）。回答「请求实际走了哪条链路」。
-        branch_total.labels(
-            handler.__name__.removeprefix("handle_") if handler is not None else "agent"
-        ).inc()
-        if handler is None:
-            return None, 0
-        branch = handler.__name__.removeprefix("handle_")
+    async def _run_handler_node(self, state, handler, dst_tool_count: int,
+                                branch: str) -> dict:
+        """执行一条确定性分支：流式写队列 → 落历史 → 推进 DST → 审计。"""
+        turn: TurnState = state["turn"]
+        queue: asyncio.Queue = state["queue"]
+        final_text: List[str] = state["final_text"]
+        # 分支分布指标：回答「请求实际走了哪条链路」
+        branch_total.labels(branch).inc()
         started = time.perf_counter()
         status, error_code = "success", ""
         with span(f"handler.{branch}", kind="internal"):
@@ -285,7 +287,35 @@ class AgentTurnService:
                     turn, f"handler.{branch}", status, error_code,
                     int((time.perf_counter() - started) * 1000),
                     {"question": turn.ctx.question}, answer)
-        return handler, dst_tool_count
+        return {"branch": branch}
+
+    async def _run_agent_node(self, state) -> dict:
+        """泛化 ReAct 兜底节点：确定性分支都不命中时交给 Agent。"""
+        branch_total.labels("agent").inc()
+        await self._produce_agent(state["turn"], state["queue"], state["final_text"])
+        return {"branch": "agent"}
+
+    # ---------- 产出阶段 ----------
+    async def _produce(self, turn: TurnState, queue: asyncio.Queue):
+        """（独立任务）经 LangGraph 状态机生成答复：路由 → 分支 → 流式产出 → 落库。"""
+        final_text: List[str] = []
+        # 身份注入点（PROJECT_AUDIT P0-3）：工具读的是服务端上下文，不是 LLM 填的参数。
+        # 必须在这里 set —— 本方法是独立任务，其上下文在任务创建时复制，父任务里 set 不会
+        # 追溯生效；set 在本任务内则天然按「一轮 = 一个任务」隔离，且随任务结束一起销毁。
+        user_token = set_current_user(turn.ctx.user.get("user_id", ""))
+        try:
+            # 一轮的根 span：覆盖确定性 handler / Agent 兜底；其内再嵌 intent/retrieve/llm/tool
+            with span("agent.turn", kind="internal"):
+                await self._get_turn_graph().ainvoke({
+                    "ctx": turn.ctx,
+                    "turn": turn,
+                    "queue": queue,
+                    "final_text": final_text,
+                    # 每轮读取，测试可 patch 模块常量
+                    "dst_enabled": DST_ENABLED,
+                })
+        finally:
+            reset_current_user(user_token)
 
     async def _produce_agent(self, turn: TurnState, queue: asyncio.Queue,
                              final_text: List[str]):

@@ -2,15 +2,15 @@
 
 面向「智能手机及配件」电商售后场景的 **RAG + 对话式 Agent** 客服系统，覆盖知识问答、订单与物流查询、退货退款办理、投诉转人工四条主链路，包含买家端对话界面与客服工作台。
 
-- 后端：Python 3.12 / FastAPI / LangChain / Chroma / MySQL 8 / Redis（可选）
+- 后端：Python 3.12 / FastAPI / LangGraph / LangChain / Chroma / MySQL 8 / Redis（可选）
 - 前端：Vue 3 / Element Plus / Vite
 - 部署：Docker Compose（app / MySQL / Redis / Prometheus / Grafana）
 
 | 指标 | 数值 |
 | --- | --- |
-| HTTP / WebSocket 端点 | 35 |
+| HTTP / WebSocket 端点 | 35（32 条路径） |
 | Agent 工具 | 5 |
-| 单元测试 | 350 个全部通过（约 14s） |
+| 单元测试 | 363 个全部通过（本机约 23s） |
 | 知识库语料 | 10 个文件（8 篇文档 + 2 份表格） |
 | 评测集 | 意图 81 条 · RAGAS 30 题 · 业务端到端 53 题 |
 | 并发压测（10 并发 × 40 请求） | P50 40.9s · P95 47.6s · P99 48.4s · 0 失败 |
@@ -31,7 +31,8 @@
 
 ## 1. 核心能力
 
-- **统一 Agent**：单 Agent 编排 5 个工具；工具身份由服务端上下文注入，LLM 只负责选择工具与业务参数。
+- **LangGraph 编排**：StateGraph 接管主链路，`START → classify 意图节点 → 条件边 → 6 条业务分支 / Agent 兜底 → END`；图不挂 checkpointer，跨轮状态由 DST 落 MySQL。
+- **统一 Agent 兜底**：单 Agent 编排 5 个工具；工具身份由服务端上下文注入，LLM 只负责选择工具与业务参数。
 - **确定性主流程**：退货 / 退款走「收集槽位 → 确认 → 建单」状态机，不依赖 LLM 工具循环；
   建单带幂等键，重复确认不会重复建单。
 - **混合检索**：BM25 + 向量双路召回，RRF 融合，Cross-Encoder 重排，绝对余弦相似度门控
@@ -44,21 +45,21 @@
 
 ```
 ┌──────────────────────────────────────────────────────┐
-│ 交互层    Vue 3（买家端 / 客服工作台）                 │
+│ 交互层    Vue 3（买家端 / 客服工作台）                   │
 ├──────────────────────────────────────────────────────┤
-│ 接入层    FastAPI、鉴权、限流、请求上下文               │
+│ 接入层    FastAPI、鉴权、限流、请求上下文                 │
 ├──────────────────────────────────────────────────────┤
-│ 编排层    轮次编排、确定性业务分支、人工会话             │
+│ 编排层    LangGraph 状态机、确定性业务分支、人工会话       │
 ├──────────────────────────────────────────────────────┤
-│ 智能体    统一 Agent（5 工具）、意图分类、DST 状态机     │
+│ 智能体    统一 Agent（5 工具）、意图分类、DST 状态机       │
 ├──────────────────────────────────────────────────────|
-│ 生成层    流式生成、输出合规护栏                        │
+│ 流式生成 流式生成、输出合规护栏                           |
 ├──────────────────────────────────────────────────────┤
-│ 检索层    路由、改写、混合检索、RRF 融合、重排、门控     │
+│ 检索层    路由、改写、混合检索、RRF 融合、重排、门控        │
 ├──────────────────────────────────────────────────────┤
-│ 数据层    加载、清洗、分块、向量入库                    │
+│ 数据层    加载、清洗、分块、向量入库                      │
 ├──────────────────────────────────────────────────────┤
-│ 基础设施  Chroma、MySQL、Redis、DashScope             │
+│ 基础设施  Chroma、MySQL、Redis、DashScope              │
 └──────────────────────────────────────────────────────┘
 ```
 
@@ -66,7 +67,7 @@
 | --- | --- | --- |
 | 交互层 | `frontend/` | 买家端对话与订单页，客服工作台与后台管理 |
 | 接入层 | `access/` | 应用装配、路由、鉴权、限流、请求上下文 |
-| 编排层 | `service/` | 轮次编排、确定性业务分支、人工会话、响应缓存 |
+| 编排层 | `service/` | LangGraph 图编排、确定性业务分支、人工会话、响应缓存 |
 | 智能体 | `agent/` | 统一 Agent、意图分类、DST 状态机、工具实现 |
 | 生成层 | `generation/` | 流式生成、输出合规护栏 |
 | 检索层 | `retrieval/` | 路由、改写、混合检索、RRF、重排、置信度门控 |
@@ -77,7 +78,7 @@
 
 | 类别 | 选型 |
 | --- | --- |
-| 后端框架 | FastAPI（单进程 uvicorn）+ LangChain |
+| 后端框架 | FastAPI（单进程 uvicorn）+ LangGraph + LangChain |
 | 模型接入 | DashScope OpenAI 兼容端点，模型名见 `config/settings.py` |
 | 嵌入 | 默认 DashScope 云端（1024 维）；可切本地 `bge-base-zh-v1.5`（768 维） |
 | 向量库 | Chroma（异步封装，本地持久化） |
@@ -86,7 +87,7 @@
 | 缓存 | Redis：会话历史热缓存，不可用时回源 MySQL（fail-open） |
 | 可观测 | Prometheus 指标、Grafana 看板、请求级 trace、工具调用审计 |
 | 前端 | Vue 3（script setup）、Element Plus、Vue Router、Pinia、Vite |
-| 测试 | pytest（350 个用例） |
+| 测试 | pytest（363 个用例） |
 
 ## 4. 快速开始
 
@@ -229,7 +230,9 @@ docker compose run --rm app python -m ingestion.service
 | 公开 | 无 | 2 | `/health`、`/metrics` |
 | 认证 | 无 / 登录 | 4 | `/auth/*` |
 | 会话 | 登录 | 14 | 流式对话、历史、我的订单、转人工、WebSocket |
-| 管理 | 管理员 | 12 | 工单、订单、用户、知识库、审计与 trace |
+| 管理 | 管理员 | 15 | 工单、订单、用户、知识库、审计与 trace |
+
+端点按 HTTP 方法计数（同一路径的 GET/PATCH 分开计），共 35 个；按路径计为 32 条。
 
 ```json
 // POST /agent/stream     Authorization: Bearer <token>
@@ -244,7 +247,7 @@ docker compose run --rm app python -m ingestion.service
 AI大模型与智能体开发/
 ├── RagServerSystem/                后端服务
 │   ├── access/                     接入层：应用装配、路由、鉴权、限流
-│   ├── service/                    编排层：轮次编排、业务分支、人工会话、缓存
+│   ├── service/                    编排层：LangGraph 图编排、业务分支、人工会话、缓存
 │   ├── agent/                      智能体：统一 Agent、意图分类、DST、工具
 │   ├── generation/                 生成层：流式生成、输出护栏
 │   ├── retrieval/                  检索层：路由、改写、混合检索、重排、门控
@@ -274,7 +277,7 @@ AI大模型与智能体开发/
 ```powershell
 cd RagServerSystem
 
-python -m pytest tests -q          # 单测：350 passed
+python -m pytest tests -q          # 单测：363 passed
 python intent_eval.py rule         # 意图规则层评测：81 条，秒级、零 LLM 费用
 python intent_calibration.py       # 置信度校准：可靠性表 + ECE + 阈值扫描
 python verify_dataset.py           # 离线检索命中验证（不带参数不会改数据）
@@ -343,7 +346,9 @@ CPU 重排单点（并发下事实串行），LLM 生成（API 并发）被排�
 - 业务库（pymysql）与文档状态库（aiomysql）两套驱动并存，未统一连接池。
 - 本地模型路径为绝对路径，换机器需修改 `config/settings.py`。
 - CPU 环境下 Cross-Encoder 重排约 4s/题（20 候选真实分块；首次加载 20~25s），可用 `RERANK_MODE=none` 临时关闭。
-- 门控阈值与意图词表依赖评测集持续回归；逗号分隔的多问题不会被拆分。
+- 门控阈值与意图词表依赖评测集持续回归。
+- **单意图路由**：一张图只走一个分支，逗号分隔的多问题不会被拆分，第二个诉求可能被忽略；完整多意图需 plan 节点 + Send 子图 + 结果合并。
+- **编排层无 checkpointer**：图为单轮短事务，跨轮状态由 DST / MySQL 承担；引入人工中断或断点恢复时再加。
 - `combined_splitter` 未作默认：当前语料较短，父子分层会退化为重复存储。
 
 完整取舍说明见 [设计说明](RagServerSystem/docs/design-notes.md#8-已知限制与取舍)。
