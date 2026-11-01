@@ -1,24 +1,29 @@
-"""分块器工厂：根据配置返回对应的分块器实例"""
+"""分块器工厂：根据配置返回对应的分块器实例
+
+为什么这里没有父子分块：父子分块的收益前提是「文档多、单篇长、答案常跨小节」，
+本项目语料（12 篇、单篇最长 1.5 万字）不满足；而且它需要 parent_cache.json 单独
+维护父块映射，全项目从未生成过——生成层每轮启动都要打一条「父子分块功能不可用」
+的 WARNING。一个从不生效的策略留在选项里，只会让后来者以为它在跑。
+跨小节召回改用「同章相邻小节按预算合并」（见 base.merge_adjacent_sections），
+成本约为父子分块的十分之一。
+"""
 from config.settings import (
     CHUNKING_STRATEGY,
     CHUNK_SIZE, CHUNK_OVERLAP,
     SEMANTIC_CHUNK_THRESHOLD, SEMANTIC_BUFFER_SIZE,
     SEMANTIC_EMBEDDING_MODEL,
     SLIDING_WINDOW_STEP,
-    PARENT_CHUNK_SIZE, PARENT_CHUNK_OVERLAP,
-    CHILD_CHUNK_SIZE, CHILD_CHUNK_OVERLAP
 )
 from logs.log_config import data_layer_log as log
 from .recursive import RecursiveChunker
 from .semantic import SemanticChunker
 from .sliding_window import SlidingWindowChunker
-from .parent_child import ParentChildChunker
-from .combined_splitter import CombinedSplitter
+
 
 def get_chunker(strategy: str = None):
     """
     获取分块器实例
-    :param strategy: 可选值: recursive, semantic, sliding_window, parent_child
+    :param strategy: 可选值: recursive, semantic, sliding_window
                      默认从 settings.CHUNKING_STRATEGY 读取
     :return: BaseChunker 子类实例
     """
@@ -36,16 +41,7 @@ def get_chunker(strategy: str = None):
             chunk_size=CHUNK_SIZE,
             overlap=CHUNK_OVERLAP
         )
-    elif strategy == "parent_child":
-        return ParentChildChunker(
-            parent_chunk_size=PARENT_CHUNK_SIZE,
-            parent_overlap=PARENT_CHUNK_OVERLAP,
-            child_chunk_size=CHILD_CHUNK_SIZE,
-            child_overlap=CHILD_CHUNK_OVERLAP
-        )
-    elif strategy == "combined_splitter":          # 组合分块策略，父块采用语义感知分块，子分块采用递归分块。
-            return CombinedSplitter()
-    else:  # 默认递归分块
+    else:  # 默认递归分块（结构优先 + 相邻小节按预算合并）
         return RecursiveChunker(
             chunk_size=CHUNK_SIZE,
             chunk_overlap=CHUNK_OVERLAP

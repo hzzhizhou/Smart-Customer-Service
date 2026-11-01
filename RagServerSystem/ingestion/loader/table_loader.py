@@ -1,18 +1,10 @@
-"""表格文档解析：CSV / DOCX / XLSX 的表格统一转成「带表头的 Markdown 表格」文本块。
-
-为什么不用现成 loader：
-- Docx2txtLoader 把表格退化成单元格文字顺序拼接，行列对应关系丢失；
-- UnstructuredExcelLoader 输出逐格 "column: value" 文本，同样丢失表格结构。
-表格一旦被当成普通段落文本，下游分块会按标点/换行把它切散：表头与数据行分离、
-一行里的多个列被拆进不同的块，检索命中 "599" 这类单元格时无法还原它属于哪个商品。
-
-分块约定（与分块层的 is_table 保护配套）：
-- 每块 = 表头 + 分隔行 + 若干条完整数据行；块内绝不切开某一行，也绝不让数据行脱离表头；
-- 每块输出一个 Document，metadata 标 is_table="true"，分块层据此跳过二次切分。
+"""
+表格文档解析：CSV / DOCX / XLSX 的表格统一转成「带表头的 Markdown 表格」文本块。
 """
 import csv
+import re
 from pathlib import Path
-from typing import List, Sequence
+from typing import Dict, List, Sequence
 
 from langchain_core.documents import Document
 
@@ -85,7 +77,7 @@ def _table_documents(header: List[str], rows: List[List[str]],
 
     for part in groups:
         meta = dict(metadata)
-        meta["is_table"] = "true"
+        meta["is_table"] = True
         meta["table_rows"] = len(part)
         docs.append(Document(page_content=render_markdown_table(header, part), metadata=meta))
     return docs
@@ -100,48 +92,101 @@ def csv_to_documents(file_path: Path, budget: int = DEFAULT_TABLE_BUDGET) -> Lis
         log.warning(f"CSV 无有效数据行，跳过: {file_path.name}")
         return []
     header = raw_rows[0]
-    return _table_documents(header, _normalize_rows(header, raw_rows[1:]), {}, budget)
+    # 表格也要有归属：否则 section_path 为空，引用时只能说「出自某个表」
+    return _table_documents(header, _normalize_rows(header, raw_rows[1:]),
+                            {"Header1": file_path.stem}, budget)
+
+
+_HEADING_RE = re.compile(r"(?:heading|标题)\s*([1-9])$", re.I)
+
+
+def _heading_level(paragraph) -> int:
+    """段落是几级标题？非标题返回 0，标题最多认到 3 级。
+
+    中文 Word 的样式名是「标题 1」，英文模板是「Heading 1」，另有一些模板把
+    style_id 写成 Heading1。三种都要认——企业文档大多来自中文模板，
+    只匹配 "Heading" 会全部落空，等于没做标题识别。
+    """
+    style = getattr(paragraph, "style", None)
+    if style is None:
+        return 0
+    for raw in (getattr(style, "name", "") or "", getattr(style, "style_id", "") or ""):
+        m = _HEADING_RE.search(str(raw).strip())
+        if m:
+            return min(int(m.group(1)), 3)
+    return 0
 
 
 def docx_to_documents(file_path: Path, budget: int = DEFAULT_TABLE_BUDGET) -> List[Document]:
-    """DOCX → 段落文本块 + 表格 Markdown 块（按正文中出现顺序输出）"""
-    from docx import Document as DocxFile
+    """DOCX → 按标题样式切分的元素块（段落按节、表格为节内原子块）。
+
+    为什么不再「遇到表格切一刀」：docx 没有 Markdown 那种显式标记，结构只能从
+    paragraph.style 推断。旧的按表格切分有三个实测后果：
+
+      1) Header1/2/3 全空 → section_path 为空 → 相邻小节合并、标题前缀、引用定位
+         对 Word 文档全部失效，只能按 768 字硬切；
+      2) 表格成了章节边界：「1.1 七天无理由退货」的正文被夹在表格前后，切成两半；
+      3) 段落段没有章节切分，短小节（实测「1.2 退货流程」41 字）会因 MIN_CHUNK_SIZE
+         被整段丢弃，日志里只有一行「过滤过短块」。
+
+    现在：标题段落只更新层级上下文（自身不进正文，由前缀承担），正文按节累积；
+    表格作为「当前节内的一张表」输出，并继承当前章节信息，不打断章节。
+    """
+    from docx import Document as _Docx
     from docx.oxml.ns import qn
     from docx.table import Table
     from docx.text.paragraph import Paragraph
 
-    docx = DocxFile(str(file_path))
+    docx = _Docx(str(file_path))
     docs: List[Document] = []
+    headers: Dict[int, str] = {1: "", 2: "", 3: ""}
     buffer: List[str] = []
     table_index = 0
 
+    def current_meta() -> Dict[str, object]:
+        meta: Dict[str, object] = {"is_table": False}
+        for lvl in (1, 2, 3):
+            if headers[lvl]:
+                meta[f"Header{lvl}"] = headers[lvl]
+        return meta
+
+    def flush() -> None:
+        nonlocal buffer
+        if buffer:
+            docs.append(Document(page_content="\n".join(buffer), metadata=current_meta()))
+            buffer = []
+
     for child in docx.element.body.iterchildren():
         if child.tag == qn("w:p"):
-            text = Paragraph(child, docx).text.strip()
-            if text:
+            para = Paragraph(child, docx)
+            text = para.text.strip()
+            if not text:
+                continue
+            level = _heading_level(para)
+            if level:
+                flush()                       # 上一节收口
+                headers[level] = text         # 开新节
+                for deeper in range(level + 1, 4):
+                    headers[deeper] = ""      # 更深的层级失效
+            else:
                 buffer.append(text)
         elif child.tag == qn("w:tbl"):
-            if buffer:
-                docs.append(Document(page_content="\n".join(buffer),
-                                     metadata={"is_table": "false"}))
-                buffer = []
+            flush()
             table_rows = [[_cell(cell.text) for cell in row.cells]
                           for row in Table(child, docx).rows]
             table_rows = [row for row in table_rows if any(row)]
             if len(table_rows) < 2:
                 # 单行表（多为排版用表）：按普通文本保内容，不足两行无法构成表头+数据
                 if table_rows:
-                    docs.append(Document(page_content=" | ".join(table_rows[0]),
-                                         metadata={"is_table": "false"}))
+                    buffer.append(" | ".join(table_rows[0]))
                 continue
             header = table_rows[0]
             docs.extend(_table_documents(
                 header, _normalize_rows(header, table_rows[1:]),
-                {"table_index": table_index}, budget))
+                {**current_meta(), "table_index": table_index}, budget))
             table_index += 1
 
-    if buffer:
-        docs.append(Document(page_content="\n".join(buffer), metadata={"is_table": "false"}))
+    flush()
     return docs
 
 
@@ -161,7 +206,8 @@ def xlsx_to_documents(file_path: Path, budget: int = DEFAULT_TABLE_BUDGET) -> Li
             header = raw_rows[0]
             docs.extend(_table_documents(
                 header, _normalize_rows(header, raw_rows[1:]),
-                {"sheet_name": str(sheet.title)}, budget))
+                {"Header1": file_path.stem, "Header2": str(sheet.title),
+                 "sheet_name": str(sheet.title)}, budget))
     finally:
         workbook.close()
     return docs

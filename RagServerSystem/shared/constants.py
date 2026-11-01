@@ -75,7 +75,8 @@ def is_my_orders_query(question: str) -> bool:
 _SUBQ_SEPARATOR_RE = re.compile(r"[?？;；\n]+")
 # 连接词必须出现在句首或标点/空白之后才算分界：「还有没有别的颜色」里的"还有"不算
 _SUBQ_CONNECTOR_RE = re.compile(
-    r"(?:^|[，,。.\s]+)(?P<c>另外|还有|以及|顺便|同时|再有|再问|还想问|另外就是)")
+    r"(?:^|[，,。.\s]+)(?P<c>并且|然后|接着|再说|再问|再帮我看看|顺便问下|"
+    r"另外|还有|以及|顺便|同时|再有|还想问|另外就是)")
 SUBQ_MIN_LEN = 4   # 短于此长度的片段视为切分噪声（如「呢」「谢谢」），丢弃
 _SUBQ_TRIM = " \t\r\n,，。.、:："
 
@@ -127,6 +128,41 @@ def split_sub_questions(question: str) -> List[str]:
     return cleaned if len(cleaned) >= 2 else [text]
 
 
+# 主题锚点：用于判断「连接词没命中，但一句话里问了两件不同领域的事」。
+# 实测「给我介绍一下会员规则，并且说一下有哪几款手机在出售」——「并且」进词表前不拆，
+# 整句一个向量去检索，两个主题互相稀释，top 分掉到 low 直接拒答。
+# 注意按“主题组”计数而不是按词计数：单主题问题里也会出现多个词（会员 + 积分）。
+_TOPIC_GROUPS = {
+    "member": ("会员", "积分", "等级", "折扣", "优惠券"),
+    "after_sale": ("退货", "退款", "换货", "运费", "保修", "维修", "三包"),
+    "product": ("手机", "机型", "iphone", "小米", "华为", "参数", "配置", "在售"),
+    "logistics": ("物流", "发货", "快递", "配送", "签收"),
+    "invoice": ("发票", "开票", "专票"),
+    "extend": ("延保", "以旧换新", "回收"),
+    "ticket": ("工单", "投诉", "进度"),
+}
+
+
+def count_topic_groups(question: str) -> int:
+    """一句话里出现了几个不同主题组（小写匹配，兼容 iPhone/iphone）。"""
+    text = (question or "").lower()
+    return sum(1 for words in _TOPIC_GROUPS.values()
+               if any(w in text for w in words))
+
+
+_QUESTION_HINTS = ("吗", "呢", "？", "?", "怎么", "什么", "多少", "多久", "能否", "是否", "可以")
+
+
+def looks_like_question(text: str) -> bool:
+    """粗判疑问句。
+
+    用途：多意图分析时，规则词表没命中的子句（如「能开专票吗」在补「专票」词之前
+    零命中）如果连问句特征都没有，就会既没有意图标签、也不进任何分支——整句只剩
+    动作意图，咨询那半句被静默丢掉。
+    """
+    return any(h in (text or "") for h in _QUESTION_HINTS)
+
+
 def looks_like_multi_question(question: str) -> bool:
     """规则拆不出多段时，判断文本「看起来像多问题」（决定是否值得花一次 LLM 拆分）。
 
@@ -136,7 +172,10 @@ def looks_like_multi_question(question: str) -> bool:
     text = question or ""
     if len(_SUBQ_SEPARATOR_RE.findall(text)) >= 2:
         return True
-    return any(_iter_split_connectors(text))
+    if any(_iter_split_connectors(text)):
+        return True
+    # 连接词兜不住时看主题：两个不同领域 = 多半是两个诉求，值得花一次 LLM 拆分
+    return count_topic_groups(question) >= 2
 
 
 # 模型偶发把「无 / 无相关信息」这类空答复当成正文吐出来（多见于没带订单号的查询类问题，

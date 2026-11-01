@@ -20,8 +20,6 @@ tests/
 deploy/
 evaluation/
 e2e_online_test.py
-e2e_business_eval.py
-verify_dataset.py
 intent_eval.py
 intent_calibration.py
 README.md

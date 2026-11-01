@@ -11,9 +11,27 @@ from typing import List
 
 from langchain_core.documents import Document
 
-from config.settings import RERANK_CANDIDATES, RERANK_MODEL_PATH, RERANK_TOP_N
+from config.settings import (RERANK_CANDIDATES, RERANK_MAX_CHARS, RERANK_MAX_QUEUE,
+                             RERANK_MODEL_PATH, RERANK_TIMEOUT, RERANK_TOP_N)
 from logs.log_config import retrieval_layer_log as log
 from retrieval.fusion import dedupe_docs
+from utils.thread_pool_manager import get_thread_pool
+
+
+def _queue_depth(pool) -> int:
+    """池里正在排队的任务数（不含正在执行的那些）。
+
+    为什么直接读池队列：真正的并发上限是 ThreadPoolExecutor 的 worker 数，
+    排队也发生在它的内部队列里。曾试过另建 asyncio.Semaphore 做闸门，结果是
+    「每个重排器实例一份」的第二套口径——实例之间不互斥，跨实例的排队仍然
+    排在池队列里、完全不受控（实测 4 个占位任务仍让第 5 个等了 3.8s）。
+    _work_queue 是私有属性，但它是唯一能反映真实排队的地方；取不到就退化为 0。
+    """
+    queue = getattr(pool, "_work_queue", None)
+    try:
+        return queue.qsize() if queue is not None else 0
+    except Exception:
+        return 0
 
 
 class CrossEncoderReranker:
@@ -57,7 +75,7 @@ class CrossEncoderReranker:
                 return False
             loop = asyncio.get_running_loop()
             try:
-                await loop.run_in_executor(None, self._load_model)
+                await loop.run_in_executor(get_thread_pool("rerank"), self._load_model)
             except Exception as e:
                 self._load_failed = True
                 log.error(f"Cross-Encoder 模型加载失败（{self.model_path}），"
@@ -79,7 +97,7 @@ class CrossEncoderReranker:
         # 也一并热掉，否则这部分仍会留在首个真实请求里
         loop = asyncio.get_running_loop()
         try:
-            await loop.run_in_executor(None, self._model.predict, [("预热", "模型")])
+            await loop.run_in_executor(get_thread_pool("rerank"), self._model.predict, [("预热", "模型")])
         except Exception as e:
             log.warning(f"Cross-Encoder 预热推理失败（不影响后续正常使用）: {e}")
         return True
@@ -96,10 +114,38 @@ class CrossEncoderReranker:
             return candidates[:self.top_n]
 
         start_time = time.time()
-        pairs = [(query, doc.page_content) for doc in candidates]
+        # 只把正文头部送进模型打分：Cross-Encoder 的注意力开销随序列长度增长，
+        # 而块头部通常已包含判定相关性所需的关键句（标题/首段结论）。
+        # 返回给下游的仍是完整 chunk，所以这只影响「排序依据」，不影响「答案素材」。
+        pairs = [(query, (doc.page_content or "")[:RERANK_MAX_CHARS])
+                 for doc in candidates]
         loop = asyncio.get_running_loop()
+        pool = get_thread_pool("rerank")
+        # 池里已经排起队 → 直接放弃重排。判据用「池队列深度」而不是自己计并发：
+        # 真正的执行位是池的 worker，排队也发生在池的内部队列里。
+        depth = _queue_depth(pool)
+        if depth >= RERANK_MAX_QUEUE:
+            log.warning(
+                f"重排队列已积压（排队 {depth} 个 > 上限 {RERANK_MAX_QUEUE}），跳过重排、沿用融合序",
+                extra={"event": "rerank.rejected", "queue_depth": depth},
+            )
+            return candidates[:self.top_n]
+
         try:
-            scores = await loop.run_in_executor(None, self._model.predict, pairs)
+            # 走专属 rerank 池而不是默认池：默认池 max_workers = min(32, 核数+4)，
+            # 是给所有阻塞调用共用的一张网，在上面跑 CPU 密集任务等于没有并发上限。
+            # 这里的超时只防「模型异常挂死」，不用于卡排队（那由上面的队列深度判定）。
+            # 一点权衡：超时后线程仍在跑完（线程无法取消），但请求已不再等它。
+            scores = await asyncio.wait_for(
+                loop.run_in_executor(pool, self._model.predict, pairs),
+                timeout=RERANK_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            log.error(
+                f"重排执行超时（>{RERANK_TIMEOUT}s），疑似模型异常，降级为不重排",
+                extra={"event": "rerank.timeout", "candidates": len(pairs)},
+            )
+            return candidates[:self.top_n]
         except Exception as e:
             log.error(f"Cross-Encoder 推理失败，降级为不重排、保持融合序: {e}")
             return candidates[:self.top_n]
@@ -108,6 +154,9 @@ class CrossEncoderReranker:
             doc.metadata["rerank_score"] = float(score)
         candidates.sort(key=lambda doc: doc.metadata["rerank_score"], reverse=True)
         reranked_docs = candidates[:self.top_n]
-        log.info(f"Cross-Encoder 重排序完成，候选 {len(pairs)} → 返回 {len(reranked_docs)} 个文档，"
-                 f"耗时 {time.time() - start_time:.3f}s")
+        log.info("重排完成", extra={
+            "event": "rerank.done", "candidates": len(pairs), "returned": len(reranked_docs),
+            "chars": RERANK_MAX_CHARS,
+            "dur_ms": round((time.time() - start_time) * 1000, 1),
+        })
         return reranked_docs

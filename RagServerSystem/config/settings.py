@@ -22,7 +22,7 @@ LOCAL_EMBEDDING_MODEL = os.getenv("LOCAL_EMBEDDING_MODEL") or str(
     BASE_DIR.parent / "models" / "bge-base-zh-v1.5")  # 768 维
 # 云端模型（仅当 EMBEDDING_BACKEND="dashscope" 时使用）
 DASHSCOPE_EMBEDDING_MODEL = "qwen3.7-text-embedding-flash"  # 1024维
-DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")  # 从 .env 读取
+DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")
 
 # ====================== LLM 生成链路（供应商可切换） ======================
 # 模型/端点/key 全部从 .env 注入，换供应商（DeepSeek/GLM/SiliconFlow 等任意
@@ -33,6 +33,8 @@ LLM_MODEL = os.getenv("LLM_MODEL", "qwen3.7-flash-2026-07-15")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL","https://dashscope.aliyuncs.com/compatible-mode/v1")
 # 生成链路专用 key：与 DASHSCOPE_API_KEY 分离（后者被 DashScopeEmbeddings 占用），
 # 两家供应商混用时互不干扰；缺省回退通义 key，保持单供应商部署零配置。
+# 生成链路 key：优先 .env 的 LLM_API_KEY（换供应商时用它），缺省回退通义 key。
+# 只写 DASHSCOPE_API_KEY 会让「端点换 deepseek、key 还是通义」→ 401，即主备都连不上。
 LLM_API_KEY = os.getenv("LLM_API_KEY") or DASHSCOPE_API_KEY
 LLM_TEMPERATURE = 0.01  # 无幻觉：固定温度
 LLM_SEED = 42            # 固定随机种子（结果稳定）
@@ -73,19 +75,13 @@ AUTO_FILTER_DEFAULT = os.getenv("AUTO_FILTER", "true").lower() != "false"
 
 
 # ====================== 分块策略配置 ======================
-CHUNKING_STRATEGY = "recursive"  # 可选: recursive, semantic, sliding_window, parent_child, combined_splitter
+CHUNKING_STRATEGY = "recursive"  # 可选: recursive, semantic, sliding_window
 SEMANTIC_EMBEDDING_MODEL = os.getenv("SEMANTIC_EMBEDDING_MODEL") or LOCAL_EMBEDDING_MODEL  # 语义分块复用本地嵌入模型
 SEMANTIC_CHUNK_THRESHOLD = 0.75   # 句子相似度阈值（低于则切分）
 SEMANTIC_BUFFER_SIZE = 2           # 切分时前后保留的句子数
 
 # 滑动窗口分块参数
 SLIDING_WINDOW_STEP = 256          # 滑动步长（若未设置，则使用 CHUNK_SIZE - CHUNK_OVERLAP）
-
-# 父子分块参数
-PARENT_CHUNK_SIZE = 2000           # 父块大小
-PARENT_CHUNK_OVERLAP = 200         # 父块重叠
-CHILD_CHUNK_SIZE = 400             # 子块大小
-CHILD_CHUNK_OVERLAP = 40           # 子块重叠
 
 TABLE_CHUNK_SIZE = 1000            # 表格块大小（表头 + 约 5~6 行）
 
@@ -154,7 +150,8 @@ RERANK_MODEL_PATH = os.getenv("RERANK_MODEL_PATH",
                               str(BASE_DIR.parent / "models" / "bge-reranker-base"))
 # 送进 Cross-Encoder 的候选上限：CPU 下打分耗时与候选数成正比，截断以控延迟
 # （RERANK_TOP_N 是最终返回数，本值是打分规模，应 ≥ RERANK_TOP_N）
-RERANK_CANDIDATES = 20
+RERANK_CANDIDATES = int(os.getenv("RERANK_CANDIDATES", "20"))
+RERANK_MAX_CHARS = int(os.getenv("RERANK_MAX_CHARS", "320"))
 
 # 置信度门控阈值（量纲 = 余弦相似度 cos）
 CONFIDENCE_HIGH_THRESHOLD = 0.80    # top cos >= 该值且 margin 充足 → high，直接回答
@@ -221,11 +218,26 @@ CIRCUIT_FAILURE_THRESHOLD = 5   # 连续失败该次数后熔断（CLOSED→OPEN
 CIRCUIT_RECOVERY_TIMEOUT = 60  # 熔断后等待该秒数后进入半开探测（OPEN→HALF_OPEN）
 CIRCUIT_HALF_OPEN_MAX_CALLS = 1  # 半开态允许的探测请求数（探测成功→CLOSED，失败→OPEN）
 
-# 日志配置统一在 logs/log_config.py（级别/轮转/输出目标），此处不再重复声明。
-# 该模块自带降级逻辑、可独立于 config 使用，故不反向依赖本文件。
-# 文件侧 JSON 结构化输出（每行一个 JSON 对象，含 request_id）；
-# 控制台始终为纯文本（含 request_id），便于开发阅读。False 可回退旧纯文本格式。
+# 日志配置统一在 logs/log_config.py（级别/轮转/输出目标），此处只暴露入口参数。
 LOG_FORMAT_JSON = True
+# 日志目录：测试与本地开发用环境变量隔离，避免 pytest 的 ERROR 混进真实告警
+LOG_DIR = Path(os.getenv("RAG_LOG_DIR") or (BASE_DIR / "logs"))
+LOG_LEVEL = os.getenv("RAG_LOG_LEVEL", "INFO")
+LOG_BACKUP_DAYS = int(os.getenv("RAG_LOG_BACKUP_DAYS", "7"))
+
+# ====================== LLM 计费单价 ======================
+# 单位：元 / 千 token。留空 = 未配置 → 日志里不输出 cost 字段（宁可不报，也不报错数）。
+# 单价随供应商调整，务必按当期账单核对后写入 .env，不要写死在代码里。
+def _price(name: str):
+    raw = os.getenv(name, "").strip()
+    try:
+        return float(raw) if raw else None
+    except ValueError:
+        return None
+
+
+LLM_PRICE_IN_PER_1K = _price("LLM_PRICE_IN_PER_1K")
+LLM_PRICE_OUT_PER_1K = _price("LLM_PRICE_OUT_PER_1K")
 
 # Redis配置
 REDIS_CONFIG = {
@@ -278,6 +290,13 @@ VECTOR_THREAD_POOL_NAME = "vector-retriever-pool"
 VECTOR_ASYNC_TIMEOUT = 10
 
 HYBRID_ASYNC_TIMEOUT = 10
+
+# 重排（Cross-Encoder，CPU 密集）：并发上限与排队超时
+RERANK_CONCURRENCY = int(os.getenv("RERANK_CONCURRENCY", str(max(1, min(4, CPU_CORES // 4)))))
+RERANK_TORCH_THREADS = int(os.getenv("RERANK_TORCH_THREADS", "0"))
+RERANK_MAX_QUEUE = int(os.getenv("RERANK_MAX_QUEUE", str(max(1, RERANK_CONCURRENCY))))
+# 兜底超时：防模型异常挂死把请求永久卡住。给得宽（实测 2 个并发各约 3s），
+RERANK_TIMEOUT = float(os.getenv("RERANK_TIMEOUT", "15"))
 
 
 #-----------MySQL配置---------------------

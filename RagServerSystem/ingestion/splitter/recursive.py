@@ -5,7 +5,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from config.settings import CHUNK_SIZE, CHUNK_OVERLAP
 from logs.log_config import data_layer_log as log
 from .base import (
-    split_by_markdown_headers, add_chunk_metadata,
+    split_by_markdown_headers, add_chunk_metadata, merge_adjacent_sections, MERGE_BUDGET,
+    absorb_short_sections,
     is_table_doc, is_markdown_table_row, split_table_segments, markdown_table_chunks
 )
 
@@ -28,6 +29,15 @@ class RecursiveChunker():
     def split_documents(self, docs: List[Document]) -> List[Document]:
         # 1. 对 Markdown 文件进行结构切分
         structure_chunks = split_by_markdown_headers(docs)
+
+        #相邻小节按预算合并。结构切分只「向下切」，粒度由文档有多少个三级标题决定。这里补上「太小就向上合并」，让块大小由内容量决定
+        before_merge = len(structure_chunks)
+        structure_chunks = merge_adjacent_sections(structure_chunks)
+        # 仍短于最小块长度的残块（Word 的「一句话小节」）并回同章相邻块，不直接丢
+        structure_chunks = absorb_short_sections(structure_chunks)
+        if len(structure_chunks) != before_merge:
+            log.info(f"相邻小节合并：{before_merge} → {len(structure_chunks)} 块"
+                     f"（预算 {MERGE_BUDGET} 字）")
 
         # 2. 递归控制长度
         final_chunks = []

@@ -87,7 +87,7 @@ class DataLayer:
     # --------------------兼容/便捷入口--------------------
     @staticmethod
     async def data_loader(dir_path=None, mode: str = "full", total_timeout: int = 600):
-        """兼容入口：默认全量重建（verify_dataset 等历史调用方使用）。"""
+        """兼容入口：默认全量重建（供脚本/测试直接调用）。"""
         await DataLayer.ingest(dir_path, mode=mode, total_timeout=total_timeout)
 
 

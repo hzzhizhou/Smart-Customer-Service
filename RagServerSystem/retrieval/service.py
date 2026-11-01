@@ -3,6 +3,7 @@
 通过路由实现智能检索，选择合适的检索方式
 实现HyDE,重排序
 """
+import logging
 from functools import partial
 from infrastructure.EmbeddingService.embedding_service import EmbeddingService
 from typing import List, Tuple, Optional
@@ -104,23 +105,44 @@ class RetrievalService:
         sub_questions = await self._decompose_queries(rewritten_question)
         retrieval_stage_duration_seconds.labels("decompose").observe(time.time() - decompose_start)
 
-        log.debug(f"查询改写耗时:{time.time() - start_time}")
+        log.debug("查询改写完成", extra={"event": "retrieval.rewrite.done",
+                                       "dur_ms": round((time.time() - start_time) * 1000, 1)})
         retriever_time = time.time()
 
-        if len(sub_questions) > 1:
-            with span("retrieval.retrieve", kind="client"):
-                final_docs, retriever_type, gate_info = await self._retrieve_per_sub_question(
-                    sub_questions, route_mode, filter_metadata, auto_filter)
-        else:
-            with span("retrieval.retrieve", kind="client"):
-                final_docs, retriever_type, gate_info = await self._retrieve_one(
-                    rewritten_question, original_question, route_mode,
-                    filter_metadata, auto_filter, use_hyde, use_multi)
+        # 检索主链路的兜底观测：路由/嵌入阶段的异常（例如 embedding 服务 401）
+        # 会在进入 search 之前就抛出，若只在下游埋点，日志里会完全看不到「检索失败」。
+        try:
+            if len(sub_questions) > 1:
+                with span("retrieval.retrieve", kind="client"):
+                    final_docs, retriever_type, gate_info = await self._retrieve_per_sub_question(
+                        sub_questions, route_mode, filter_metadata, auto_filter)
+            else:
+                with span("retrieval.retrieve", kind="client"):
+                    final_docs, retriever_type, gate_info = await self._retrieve_one(
+                        rewritten_question, original_question, route_mode,
+                        filter_metadata, auto_filter, use_hyde, use_multi)
+        except Exception as exc:                       # noqa: BLE001 记录后原样抛出
+            log.error("检索失败", extra={
+                "event": "retrieval.error",
+                "dur_ms": round((time.time() - retriever_time) * 1000, 1),
+                "route_mode": route_mode, "sub_q": len(sub_questions),
+                "err": f"{type(exc).__name__}: {exc}",
+            })
+            raise
 
         end_time = time.time() - retriever_time
-        log.info(f"检索完成，检索器={retriever_type}，返回文档数={len(final_docs)},"
-                 f"置信度={gate_info['level']}(top={gate_info['top_score']}),"
-                 f"子问数={len(sub_questions)},检索总耗时：{end_time:.2f}秒")
+        # 一次检索的汇总事件：耗时、命中数、门控结论、子问数全在一行里，
+        # 排障时先看 event=retrieval.done，再看它前后的 search/rerank 事件看耗时分布。
+        log.info("检索完成", extra={
+            "event": "retrieval.done",
+            "retriever": retriever_type,
+            "hits": len(final_docs),
+            "gate": gate_info["level"],
+            "top_score": round(float(gate_info.get("top_score") or 0.0), 4),
+            "sub_q": len(sub_questions),
+            "dur_ms": round(end_time * 1000, 1),
+            "total_ms": round((time.time() - start_time) * 1000, 1),
+        })
         # 回收预取任务（其内部已吞异常；这里确保不遗留未完成/未回收的后台任务）
         await asyncio.gather(prefetch_task, return_exceptions=True)
         # 整段检索耗时（含预取回收）：与 rewrite/decompose/search/rerank 各阶段对账
@@ -176,17 +198,50 @@ class RetrievalService:
         两段分开打点：召回（多查询并行）与精排（融合去重 + Cross-Encoder）。
         CPU 环境下 Cross-Encoder 是检索侧主要耗时来源，拆开才能看出占比。
         """
+        # 计时与打点放进 finally：失败时同样要落一条（带 dur_ms 与原因）。
+        # 之前的写法把日志放在成功路径末尾，向量库 401 一抛异常，日志里就只剩一个
+        # 空 span —— 排障时看不到「哪一段、花了多久、为什么失败」。
         search_start = time.time()
-        with span("retrieval.search", kind="client"):
-            results_list = await asyncio.gather(
-                *[retriever.ainvoke(q, filter=filter_arg) for q in queries])
-        candidates = [doc for sublist in results_list for doc in sublist]
-        retrieval_stage_duration_seconds.labels("search").observe(time.time() - search_start)
+        candidates = []
+        search_err = ""
+        try:
+            with span("retrieval.search", kind="client"):
+                results_list = await asyncio.gather(
+                    *[retriever.ainvoke(q, filter=filter_arg) for q in queries])
+            candidates = [doc for sublist in results_list for doc in sublist]
+        except Exception as exc:                       # noqa: BLE001 记录后原样抛出
+            search_err = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            search_ms = (time.time() - search_start) * 1000
+            retrieval_stage_duration_seconds.labels("search").observe(search_ms / 1000)
+            log.log(logging.ERROR if search_err else logging.INFO,
+                    "召回失败" if search_err else "召回完成",
+                    extra={"event": "retrieval.search.error" if search_err
+                           else "retrieval.search.done",
+                           "queries": len(queries), "hits": len(candidates),
+                           "dur_ms": round(search_ms, 1), "filtered": bool(filter_arg),
+                           **({"err": search_err} if search_err else {})})
 
         rerank_start = time.time()
-        with span("retrieval.rerank", kind="client"):
-            merged = await self._merge_results(candidates, rerank_query)
-        retrieval_stage_duration_seconds.labels("rerank").observe(time.time() - rerank_start)
+        merged = []
+        rerank_err = ""
+        try:
+            with span("retrieval.rerank", kind="client"):
+                merged = await self._merge_results(candidates, rerank_query)
+        except Exception as exc:                       # noqa: BLE001
+            rerank_err = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            rerank_ms = (time.time() - rerank_start) * 1000
+            retrieval_stage_duration_seconds.labels("rerank").observe(rerank_ms / 1000)
+            log.log(logging.ERROR if rerank_err else logging.INFO,
+                    "重排失败" if rerank_err else "重排完成",
+                    extra={"event": "retrieval.rerank.error" if rerank_err
+                           else "retrieval.rerank.done",
+                           "in": len(candidates), "out": len(merged),
+                           "dur_ms": round(rerank_ms, 1),
+                           **({"err": rerank_err} if rerank_err else {})})
         # 门控只看「召回候选」（去重后），与重排结果解耦
         return merged, dedupe_docs(candidates)
 
@@ -201,7 +256,8 @@ class RetrievalService:
         queries = [search_question]
         if use_multi:
             queries = await self.query_enhancer.multi_query(search_question)
-            log.info(f"生成的多个问题{queries}")
+            log.info("多查询扩展完成", extra={"event": "retrieval.expand.done",
+                                              "queries": len(queries), "mode": "multi_query"})
         elif use_hyde:
             queries = [await self.query_enhancer.hyde(search_question)]
 
@@ -209,7 +265,8 @@ class RetrievalService:
             queries, retriever, rerank_question, filter_arg)
         if filter_arg and not docs:
             # 过滤后一条都不剩（关键词猜错类别 / 该类目无内容）→ 回退全库，宁可多检索也不漏答
-            log.info(f"预过滤后无命中，回退全库检索 | filter={filter_arg}")
+            log.info("预过滤后无命中，回退全库",
+                     extra={"event": "retrieval.filter.fallback", "filter": str(filter_arg)})
             docs, candidates = await self._search_and_rerank(
                 queries, retriever, rerank_question, None)
         with span("retrieval.gate", kind="internal"):
@@ -233,7 +290,9 @@ class RetrievalService:
             filter_arg = self._infer_filter(sub_q, filter_metadata, auto_filter)
             docs, candidates = await self._search_and_rerank([sub_q], retriever, sub_q, filter_arg)
             if filter_arg and not docs:
-                log.info(f"预过滤后无命中，回退全库检索 | 子问={sub_q} filter={filter_arg}")
+                log.info("子问预过滤后无命中，回退全库",
+                         extra={"event": "retrieval.filter.fallback",
+                                "sub_q": sub_q, "filter": str(filter_arg)})
                 docs, candidates = await self._search_and_rerank([sub_q], retriever, sub_q, None)
             return docs, candidates, retriever_type
 
@@ -251,10 +310,13 @@ class RetrievalService:
             if len(answerable) != len(doc_lists):
                 log.info(f"多子问门控：{len(doc_lists) - len(answerable)} 个子问置信度不足已剔除，"
                          f"仅用其余 {len(answerable)} 个作答")
+            missing = [q for q, gate in zip(sub_questions, gates) if gate["level"] == "low"]
             return (self._merge_sub_results([d for d, _ in answerable]), retriever_type,
-                    self._combine_gates([g for _, g in answerable]))
+                    self._combine_gates([g for _, g in answerable], missing))
         # 所有子问都答不了 → 保持整体转人工
-        return self._merge_sub_results(doc_lists), retriever_type, self._combine_gates(gates)
+        # 全部低置信：整轮转人工，missing 记全部子问，便于上游给出一致的缺失说明
+        return (self._merge_sub_results(doc_lists), retriever_type,
+                self._combine_gates(gates, list(sub_questions)))
 
     @staticmethod
     def _merge_sub_results(doc_lists: List[List[Document]]) -> List[Document]:
@@ -279,10 +341,12 @@ class RetrievalService:
         return merged
 
     @staticmethod
-    def _combine_gates(gates: List[dict]) -> dict:
+    def _combine_gates(gates: List[dict], missing: Optional[List[str]] = None) -> dict:
         """多子问门控合并：整体取最弱子问（top_score 取 min、should_escalate 取 any）。
 
         只按最强子问判 high 会让弱子问被硬答成幻觉；取最弱才能保证"答不了就转人工"。
+        missing 是「被剔除的低置信子问」，单独带出去：上层据此在答复里**说明哪部分没答**，
+        而不是让用户以为整句都被拒了。
         """
         rank = {"low": 0, "medium": 1, "high": 2}
         weakest = min(gates, key=lambda g: (rank.get(g["level"], 0), g["top_score"]))
@@ -293,6 +357,7 @@ class RetrievalService:
             "level": weakest["level"],
             "should_escalate": any(g["should_escalate"] for g in gates),
             "reason": weakest["reason"],
+            "missing": list(missing or []),
         }
 
     def _compute_confidence_gate(self, docs: List[Document]) -> dict:

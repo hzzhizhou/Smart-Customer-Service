@@ -1,6 +1,4 @@
 """F 批回归测试：RAG 正确性四项（BM25 $in / 门控前置 / 分块上限 / auto_filter 统一）。
-
-背景（PROJECT_AUDIT §4.2(1)(2)(3)(4)）：
   (1) 多类别预过滤构造 `{"doc_category": {"$in": [...]}}`，而 BM25 只做等值比较 →
       BM25 路被整个清空，混合检索静默退化成纯向量（日志上仍写 hybrid）。
   (2) 置信度门控取的是「重排后 TOP5」的 vector_score；重排把向量分最高的文档挤出后，
@@ -155,7 +153,6 @@ class TestChunkSizeGuard:
     def test_no_warning_when_within_limit(self, monkeypatch):
         monkeypatch.setattr(settings, "CHUNK_SIZE", 400)
         monkeypatch.setattr(settings, "TABLE_CHUNK_SIZE", 400)
-        monkeypatch.setattr(settings, "PARENT_CHUNK_SIZE", 400)
         monkeypatch.setattr(settings, "EMBEDDING_MODEL_MAX_TOKENS", 8192)
         monkeypatch.setattr(settings, "CHUNK_PREFIX_OVERHEAD", 60)
 
@@ -165,7 +162,6 @@ class TestChunkSizeGuard:
         """标题前缀也算进块长度 —— 只比 CHUNK_SIZE 会漏判。"""
         monkeypatch.setattr(settings, "CHUNK_SIZE", 500)
         monkeypatch.setattr(settings, "TABLE_CHUNK_SIZE", 500)
-        monkeypatch.setattr(settings, "PARENT_CHUNK_SIZE", 500)
         monkeypatch.setattr(settings, "EMBEDDING_MODEL_MAX_TOKENS", 512)
         monkeypatch.setattr(settings, "CHUNK_PREFIX_OVERHEAD", 60)
 
