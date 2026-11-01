@@ -12,7 +12,7 @@ import asyncio
 from agent.dst.dst_manager import ConversationState
 from agent.dst.slot_schema import Stage
 from agent.intent_classifier import IntentClassifier
-from service.handlers.return_refund import handle_return_refund
+from service.handlers.return_refund import _is_cancel_request, handle_return_refund
 
 
 class _SaveStub:
@@ -65,6 +65,31 @@ def test_cancel_hint_also_works_while_confirming():
     assert ctx.dst.intent == "chat"
 
 
+def test_turning_word_with_new_request_is_not_cancel():
+    """「算了，直接帮我退款吧」不是取消，是换动作。
+
+    实测 4 轮对话第 3 轮：用户先要退货、中途问商品、再回来说「算了，直接帮我退款吧」，
+    旧实现命中「算了」→ 回「已取消本次退款申请」，与诉求相反，并顺手清空槽位，
+    导致第 4 轮把第 1 轮给过的订单号又问了一遍。
+    """
+    ctx = _Ctx("算了，直接帮我退款吧", Stage.COLLECTING,
+               {"order_id": "SO20241122007"})
+    answer = _collect(ctx)
+    assert "已取消" not in answer
+    assert ctx.dst.slots.get("order_id") == "SO20241122007"   # 槽位不能被清
+    assert ctx.dst.intent != "chat"                          # 主线不能丢
+
+
+def test_cancel_detector_keeps_real_cancellations():
+    assert _is_cancel_request("我不退货啊")
+    assert _is_cancel_request("算了先不办了")
+    assert _is_cancel_request("取消吧")
+    assert not _is_cancel_request("算了，直接帮我退款吧")
+    assert not _is_cancel_request("不用了，帮我办理退货")
+    assert not _is_cancel_request("我要退款")          # 没有取消词
+    assert not _is_cancel_request("订单到哪了")
+
+
 def test_done_copy_does_not_claim_new_request_registered():
     ctx = _Ctx("我要退货", Stage.DONE,
                {"order_id": "SO20241120001", "reason": "破损"})
@@ -106,7 +131,7 @@ def test_fabricated_order_rejected_at_slot_fill(monkeypatch):
     ctx.slot_extractor = _Extractor()
     answer = _collect(ctx)
     assert "未查询到订单号" in answer
-    assert "已为您核对" not in answer          # 不得再进入确认话术
+    assert "请确认以下信息" not in answer      # 不得再进入确认话术「请确认以下信息」
     assert "order_id" not in ctx.dst.slots      # 无效单号被清掉
     assert ctx.dst.stage == Stage.COLLECTING    # 阶段退回继续收集
     assert ctx.dst_manager.saved == 1

@@ -35,6 +35,12 @@ class TurnGraphState(TypedDict, total=False):
     intent: str         # classify 识别的意图（可观测）
     confidence: float   # 识别置信度（可观测）
     branch: str         # classify 判定的分支，条件边唯一输入
+    # 多意图分析（classify 产出、分支消费）：LangGraph 只透传**声明过**的字段，
+    # 漏声明会被静默丢弃——实测补答逻辑读不到 read_questions 就是这个原因。
+    sub_questions: list     # 原文切分的子句
+    intent_set: list        # 子句意图去重集合
+    read_questions: list    # 只读子句（动作分支前先答）
+    is_multi_intent: bool
 
 
 def route_turn(ctx, dst_enabled: bool) -> str:

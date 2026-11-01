@@ -166,7 +166,11 @@ def test_classify_node_fills_intent_and_messages(monkeypatch):
 
     result = asyncio.run(drive())
     # 路由结果写入 state["branch"]，条件边只读它
-    assert result == {"intent": "consult", "confidence": 0.9, "branch": "consult"}
+    # 路由三字段必须存在；classify 现在还额外产出多意图分析字段（sub_questions /
+    # intent_set / read_questions / is_multi_intent），用子集断言避免每次加字段都改测试
+    assert {"intent": "consult", "confidence": 0.9, "branch": "consult"}.items() <= result.items()
+    assert result["is_multi_intent"] is False          # 单句不是多意图
+    assert result["read_questions"] == []              # 无动作意图时不补答
     # 回填后的 intent_info 是下游提示词与路由的共用输入
     assert ctx.intent_info["intent"] == "consult"
     # system 意图指令注入消息列表头部，供 Agent 兜底节点使用
@@ -191,8 +195,9 @@ def test_classify_node_without_classifier_still_writes_branch():
     async def drive():
         return await svc._run_classify_node({"turn": turn, "dst_enabled": False})
 
-    assert asyncio.run(drive()) == {
-        "intent": "complaint", "confidence": 0.0, "branch": "complaint"}
+    degraded = asyncio.run(drive())
+    assert {"intent": "complaint", "confidence": 0.0, "branch": "complaint"}.items() <= degraded.items()
+    assert degraded["is_multi_intent"] is False        # 无分类器时不误判多意图
     # 未配置分类器时不注入 system 指令，消息列表保持原样
     assert turn.messages == [("user", "我要投诉")]
 

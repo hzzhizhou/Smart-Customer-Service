@@ -42,11 +42,31 @@ _VALID_QUERY_CATEGORY = {"return", "refund", "complaint", "consult", "technical"
                          "logistics", "other"}
 
 
+def _order_status_of(order_id: str) -> str:
+    """取订单当前销售状态（paid/shipped/delivered…），查不到返回空串。
+
+    只用于「决定进度条画哪几步」：工单记录里只有 order_id，没有下单时的状态快照，
+    而售后流程取决于商品此刻在哪，所以读一次订单即可。查不到就退回保守流程
+    （按已签收处理），不让渲染失败。
+    """
+    oid = (order_id or "").strip()
+    if not oid:
+        return ""
+    try:
+        from infrastructure.mysql_store import get_order
+        order = get_order(oid) or {}
+        return str(order.get("status") or "")
+    except Exception:
+        return ""
+
+
 def _render_staged_progress(ticket: dict, subject: str) -> str:
     """退货/退款工单：按业务环节拼装完整进度答复（含流转轨迹、下一步、时效、联系方式）。"""
     stage = (ticket.get("stage") or "").strip()
-    # 分类决定轨迹长度：纯退款不退货，轨迹里不出现「寄回商品 / 商家验收」
+    # 分类 + 订单状态共同决定轨迹长度：已付款未发货没有「寄回/验收」，
+    # 已发货未签收没有「商家审核/待您寄回」——否则会把不会发生的环节画成待办。
     category = (ticket.get("category") or "").strip()
+    order_status = _order_status_of(ticket.get("order_id"))
     note = (ticket.get("note") or "").strip()
     note_line = RETURN_PROGRESS_NOTE.format(note=note) if note else ""
     updated_at = ticket.get("stage_updated_at") or ticket.get("created_at") or ""
@@ -66,12 +86,13 @@ def _render_staged_progress(ticket: dict, subject: str) -> str:
     if stage in RETURN_STAGE_EXCEPTIONS:
         return RETURN_PROGRESS_ABNORMAL.format(**common)
 
-    step, total = stage_step(stage, category)
+    step, total = stage_step(stage, category, order_status)
     return RETURN_PROGRESS.format(
         step=step,
         total=total,
         sla=d["sla"],
-        timeline=render_stage_timeline(ticket.get("stage_history"), stage, category),
+        timeline=render_stage_timeline(ticket.get("stage_history"), stage,
+                                       category, order_status),
         **common,
     )
 

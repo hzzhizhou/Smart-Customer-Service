@@ -6,6 +6,11 @@ from typing import Any, Dict, List, Optional
 import pymysql
 
 from logs.log_config import log
+from shared.ticket_state import (  # noqa: F401  IllegalTransition 供调用方捕获
+    IllegalTransition,
+    normalize_status,
+    validate_transition,
+)
 
 from . import connection
 
@@ -132,7 +137,8 @@ def _parse_stage_history(raw: Any) -> List[Dict[str, str]]:
 
 
 def update_ticket_status(
-    ticket_id: str, status: str = None, note: str = None, stage: str = None
+    ticket_id: str, status: str = None, note: str = None, stage: str = None,
+    operator: str = "", reason: str = "", force: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """更新工单处理状态/处理备注/业务环节；返回更新后的工单，不存在返回 None。
 
@@ -154,11 +160,16 @@ def update_ticket_status(
             d["note"] = note
 
         if stage is not None and stage != (d.get("stage") or ""):
+            prev_stage = d.get("stage") or ""
+            # 非法流转直接拒（抛给调用方转 400），不写任何字段
+            validate_transition(prev_stage, stage, force=force)
             history = _parse_stage_history(d.get("stage_history"))
-            history.append({"stage": stage, "at": now})
-            # 人工未显式指定状态时，按环节自动推进工单状态
-            if status is None:
-                status = _STAGE_TO_STATUS.get(stage, "processing")
+            history.append({
+                "stage": stage, "at": now, "from": prev_stage,
+                "by": operator or "system", "reason": reason or "",
+            })
+            # 生命周期状态跟环节走：显式传且一致才采纳，冲突时以环节为准
+            status = normalize_status(status, stage)
             cur.execute(
                 "UPDATE tickets SET stage=%s, stage_history=%s, stage_updated_at=%s "
                 "WHERE ticket_id=%s",

@@ -9,7 +9,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 import sys
 sys.path.append(str(Path(__file__).parent.parent))
-from utils.context_format import format_context_with_parents
+from utils.context_format import format_context
 from utils.llm_factory import create_llm
 from config.settings import (
     CHAT_HISTORY_WINDOW, MAX_CONTEXT_TOKENS,
@@ -47,27 +47,10 @@ class AnswerGenerator:
             ("human", "用户问题：{question}")
         ])
         self.answer_chain = self.base_prompt | self.llm | StrOutputParser()
-        self.parent_cache = {}
-        self._load_parent_cache()
-    
-    def _load_parent_cache(self):
-        """加载父块映射文件（如果存在）"""
-        cache_path = Path(__file__).parent.parent / "parent_cache.json"
-        if cache_path.exists():
-            import json
-            with open(cache_path, "r", encoding="utf-8") as f:
-                self.parent_cache = json.load(f)
-            log.info(f"加载父块映射，共 {len(self.parent_cache)} 个父块")
-        else:
-            log.warning("未找到 parent_cache.json，父子分块功能不可用")
 
     def format_context(self, docs: List[Document]) -> str:
         # 按 token 估算截断（中文 1 字≈1 token，保守按字符数近似）
-        return format_context_with_parents(
-            docs=docs,
-            parent_cache=self.parent_cache,
-            max_context_length=MAX_CONTEXT_TOKENS
-        )
+        return format_context(docs=docs, max_context_length=MAX_CONTEXT_TOKENS)
 
     async def stream_generate(self, question: str, docs: List[Document], session_id: Optional[str] = None) -> AsyncIterator[str]:
         """
@@ -96,18 +79,26 @@ class AnswerGenerator:
                     context_str = f"对话历史:\n{history_str}\n\n上下文:\n{context_str}"
         # 熔断检查：LLM 连续失败时降级，避免雪崩
         if not llm_breaker.allow_request():
-            log.warning("LLM 熔断中，返回兜底话术")
-            yield "抱歉，AI 服务暂时不可用，已为您创建工单，人工客服将尽快与您联系。"
+            log.warning("LLM 熔断中，返回兜底话术",
+                        extra={"event": "llm.breaker.open", "stage": "generate"})
+            # 不得声称「已创建工单」：本分支只返回话术、不建单（与 reply_templates
+            # 第 335 行同一原则）。虚假承诺比不回复更糟——用户会等一个不存在的回访。
+            yield "抱歉，AI 服务暂时不可用，请稍后重试；如需人工协助，请回复「转人工」。"
             return
         try:
+            llm_start = time.perf_counter()
             full_answer = []
+            first_chunk_at = None      # 首 token 时刻：TTFT 与总生成时长要分开看
             with span("llm.generate", kind="client"):
                 async for chunk in self.answer_chain.astream({
                     "question": question,
                     "context": context_str
                 }):
+                    if first_chunk_at is None:
+                        first_chunk_at = time.perf_counter()
                     full_answer.append(chunk)
                     yield chunk
+            llm_end = time.perf_counter()
             llm_breaker.record_success()
             # 流式输出后做合规审查：若有风险，追加系统提示（不破坏已流式输出的内容）
             complete = "".join(full_answer)
@@ -117,11 +108,21 @@ class AnswerGenerator:
                 tail = safe[len(complete):]  # review 在原文后追加的提示部分
                 if tail:
                     yield tail
-            end_time = time.time()
-            log.info(f"回答生成完成 | 问题：{question[:30]},生成耗时：{end_time - start_time:.2f}秒")
+            # 结构化收尾：TTFT 看体感、gen_ms 看吞吐、chars 核对是否被截断
+            log.info("回答生成完成", extra={
+                "event": "llm.generate.done",
+                "ttft_ms": round(((first_chunk_at or llm_end) - llm_start) * 1000, 1),
+                "dur_ms": round((llm_end - llm_start) * 1000, 1),
+                "chars": len("".join(full_answer)),
+                "ctx_chars": len(context_str or ""),
+                "total_ms": round((time.time() - start_time) * 1000, 1),
+            })
         except Exception as e:
             llm_breaker.record_failure()
-            log.error(f"回答生成失败：{str(e)}")
+            log.error("回答生成失败", exc_info=True, extra={
+                "event": "llm.generate.error", "err": type(e).__name__,
+                "dur_ms": round((time.time() - start_time) * 1000, 1),
+            })
             yield "系统异常，无法生成回答，请稍后重试或联系人工客服。"
 
     async def generate(self, question: str, docs: List[Document], session_id: Optional[str] = None) -> str:

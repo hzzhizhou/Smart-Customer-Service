@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from starlette.routing import Match
 
 from config.settings import MAX_REQUEST_BODY_SIZE, RATE_LIMIT_PER_MINUTE
+from logs.log_config import log
 from utils.metrics import http_requests_total, http_request_duration_seconds
 from utils.request_context import (
     clear_request_id,
@@ -167,13 +168,58 @@ def register_request_context_middleware(app) -> None:
         set_request_id(request_id)
         trace_id = normalize_trace_id(request.headers.get("X-Trace-ID", ""), request_id)
         set_trace_id(trace_id)
+        started = time.perf_counter()
+
+        def _summary(**extra):
+            """请求级汇总：排障时的第一个入口，一行看完整请求。"""
+            fields = {
+                "event": "http.request.done",
+                "method": request.method,
+                "path": request.url.path,
+                "dur_ms": round((time.perf_counter() - started) * 1000, 1),
+                "ua": (request.headers.get("user-agent") or "")[:40],
+            }
+            fields.update(extra)
+            log.info("请求结束" if not extra.get("failed") else "请求失败", extra=fields)
+
         try:
             # 根 span：request_id/trace_id 已就绪，其内嵌套 span 的 parent_id 指向它
             with span("http_request", kind="server"):
                 response = await call_next(request)
-        finally:
+        except Exception as exc:                       # noqa: BLE001 记录后原样抛出
+            _summary(status=500, failed=True, err=f"{type(exc).__name__}: {exc}")
             clear_request_id()
             clear_trace_id()
+            raise
+
+        status_code = response.status_code
         response.headers["X-Request-ID"] = request_id
         response.headers["X-Trace-ID"] = trace_id
+
+        # 流式响应（/agent/stream、/rag/stream）的关键差异：
+        # call_next 返回时只是「响应头就绪」，正文还在后面边生成边推。
+        # 若照旧在 finally 里记 dur_ms，量到的是首字节时间，不是端到端延迟
+        # 所以这里包一层 body_iterator，等流真正结束再记总耗时。
+        if hasattr(response, "body_iterator"):
+            ttfb_ms = round((time.perf_counter() - started) * 1000, 1)
+            original = response.body_iterator
+
+            async def _wrapped():
+                chunks = 0
+                try:
+                    async for chunk in original:
+                        chunks += 1
+                        yield chunk
+                finally:
+                    _summary(status=status_code, failed=False, streamed=True,
+                             ttfb_ms=ttfb_ms, chunks=chunks)
+                    clear_request_id()
+                    clear_trace_id()
+
+            response.body_iterator = _wrapped()
+            return response
+
+        _summary(status=status_code, failed=False, streamed=False)
+        clear_request_id()
+        clear_trace_id()
         return response

@@ -5,6 +5,7 @@
 """
 from langchain_core.tools import tool
 
+from logs.log_config import log
 from retrieval.service import RetrievalService
 from utils.request_context import span
 
@@ -33,6 +34,17 @@ def build_search_knowledge(retrieval_service: RetrievalService):
                 use_hyde=False,
                 use_multi=False,
             )
+        # 工具侧也落一条：agent.tool.done 只记了外部耗时与结果摘要，
+        # 这里补充「检到了几条、置信度多少、是否建议转人工」，排障时不用再翻检索日志。
+        log.info("知识检索工具返回", extra={
+            "event": "tool.search_knowledge.done",
+            "docs": len(docs),
+            "retriever": retriever_type,
+            "gate": gate_info.get("level", "unknown"),
+            "top_score": round(float(gate_info.get("top_score") or 0.0), 4),
+            "escalate": bool(gate_info.get("should_escalate")),
+            "missing": len(gate_info.get("missing") or []),
+        })
         if not docs:
             return "未找到相关信息。建议调用 create_ticket 转人工处理。"
 
@@ -48,10 +60,17 @@ def build_search_knowledge(retrieval_service: RetrievalService):
         should_escalate = gate_info.get("should_escalate", False)
 
         result = "\n\n".join(contexts)
+        missing = gate_info.get("missing") or []
         result += (
             f"\n\n---检索质量---\n置信度: {level} (top_score={top_score})"
             f"\n建议转人工: {'是' if should_escalate else '否'}"
         )
+        # 多子问里有些子问没检索到：把缺口明确写进工具结果，让回答显式说明，
+        # 避免用户以为整句都被拒答（实测「会员规则 + 在售机型」曾被整体拒掉）
+        if missing:
+            result += ("\n未覆盖的子问: " + "、".join(missing)
+                       + "\n注意：上述子问题未检索到资料，请在回答中明确说明这部分暂时无法确认，"
+                         "并建议转人工，不要编造。")
         if should_escalate:
             result += "\n注意：本次检索置信度较低，建议调用 create_ticket 转交人工客服。"
         return result

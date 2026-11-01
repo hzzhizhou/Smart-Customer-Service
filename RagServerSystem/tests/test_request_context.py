@@ -2,8 +2,8 @@
 
 锁住四件事：
   1) 上下文读写：set/get/clear 正确，请求外读到空串；
-  2) 日志注入：JSON 行含 request_id 字段（请求内为真实值、请求外为 "-"），
-     异常栈随 exc_info 进入 JSON，控制台纯文本格式也能渲染 request_id；
+  2) 日志注入：JSON 行含 request_id / trace_id / span_id（请求内为真实值，
+     请求外为 "-"），异常栈随 exc 进入 JSON，控制台单行格式也带 trace 前缀；
   3) 中间件：生成并回写 X-Request-ID、透传外部传入值、相邻请求 id 互不串扰；
   4) 落盘集成：setup_module_logger 产生的文件日志是合法 JSON Lines。
 """
@@ -17,11 +17,11 @@ from fastapi.testclient import TestClient
 
 from access.middleware import register_request_context_middleware
 from logs.log_config import (
+    ConsoleFormatter,
     JSONFormatter,
     LOG_DATE_FORMAT,
-    LOG_FORMAT,
+    ContextFilter,
     MODULE_LOGGERS,
-    RequestContextFilter,
     setup_module_logger,
 )
 from utils.request_context import (
@@ -42,7 +42,7 @@ def _make_record(msg: str = "hello", exc_info=None) -> logging.LogRecord:
 
 def _format_with_filter(record: logging.LogRecord, formatter) -> str:
     """复刻 handler 的处理顺序：Filter 先注入 request_id，再格式化。"""
-    RequestContextFilter().filter(record)
+    ContextFilter().filter(record)
     return formatter.format(record)
 
 
@@ -87,8 +87,10 @@ class TestLoggingFormat:
         assert payload["request_id"] == rid
         assert payload["message"] == "带请求的日志"
         assert payload["level"] == "INFO"
-        assert payload["logger"] == "rag_server.unit_test"
-        assert payload["location"] == "x.py:1"
+        # 字段名随结构化改造固定为 svc / loc（见 docs/logging-spec.md 字段表）
+        assert payload["svc"] == "unit_test"
+        assert payload["loc"] == "x.py:1"
+        assert payload["trace_id"] == rid
 
     def test_json_line_dash_outside_request(self):
         clear_request_id()
@@ -105,16 +107,17 @@ class TestLoggingFormat:
             record = _make_record("出错了", exc_info=sys.exc_info())
         line = _format_with_filter(record, JSONFormatter(datefmt=LOG_DATE_FORMAT))
         payload = json.loads(line)
-        assert "ValueError: 模拟异常" in payload["exc_info"]
-        assert "\n" not in payload["exc_info"].splitlines()[0]  # 栈整体在单条 JSON 内
+        assert "ValueError: 模拟异常" in payload["exc"]
+        assert "\n" not in payload["exc"].splitlines()[0]  # 栈整体在单条 JSON 内
 
-    def test_console_plain_format_renders_request_id(self):
+    def test_console_format_renders_trace_prefix(self):
+        """控制台那行必须带 trace 前缀：排障时人眼靠它判断「是不是同一个请求」。"""
         rid = set_request_id(new_request_id())
         try:
-            text = _format_with_filter(_make_record("控制台"), logging.Formatter(LOG_FORMAT))
+            text = _format_with_filter(_make_record("控制台"), ConsoleFormatter(color=False))
         finally:
             clear_request_id()
-        assert f"[{rid}]" in text
+        assert rid[:8] in text          # 控制台只显示前 8 位，完整值在文件侧
         assert "控制台" in text
 
 

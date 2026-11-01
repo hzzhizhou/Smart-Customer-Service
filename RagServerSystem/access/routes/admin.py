@@ -17,6 +17,7 @@ from config.settings import ALLOWED_EXTENSIONS, BASE_DIR, MAX_FILE_SIZE
 from access.routes.auth import require_admin
 from infrastructure import mysql_store
 from shared.reply_templates import RETURN_STAGES, RETURN_STAGE_EXCEPTIONS
+from shared.ticket_state import IllegalTransition, next_stages
 from utils.security import DataSecurity
 
 
@@ -24,6 +25,9 @@ class TicketStatusReq(BaseModel):
     status: str | None = None   # 要更新的工单状态（可为空）
     note: str | None = None     # 处理备注（可为空）
     stage: str | None = None    # 要推进到的业务环节（退货/退款类工单，可为空）
+    operator: str = ""          # 操作人（写入 stage_history，便于追责）
+    reason: str = ""            # 变更原因（回退/强制纠正时必填）
+    force: bool = False         # 跳过状态机校验（仅管理员纠错用）
 
 
 class OrderStatusReq(BaseModel):
@@ -124,8 +128,17 @@ def register_admin_routes(app, retrieval_service):
             raise HTTPException(status_code=400, detail=f"非法环节，可选：{', '.join(sorted(_TICKET_STAGE))}")
         if req.status is None and req.note is None and req.stage is None:
             raise HTTPException(status_code=400, detail="至少提供 status、note 或 stage 之一")
-        row = await asyncio.to_thread(
-            mysql_store.update_ticket_status, ticket_id, req.status, req.note, req.stage)
+        try:
+            row = await asyncio.to_thread(
+                mysql_store.update_ticket_status, ticket_id, req.status, req.note,
+                req.stage, req.operator, req.reason, req.force)
+        except IllegalTransition as exc:
+            # 非法流转是业务规则拒绝，不是服务端故障 → 400 并把合法目标环节一起返回
+            raise HTTPException(status_code=400, detail={
+                "error": str(exc),
+                "current": exc.current,
+                "allowed": list(next_stages(exc.current)) if exc.current else [],
+            })
         if row is None:
             raise HTTPException(status_code=404, detail=f"工单不存在: {ticket_id}")
         return row

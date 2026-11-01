@@ -9,16 +9,8 @@ grep 同一个 request_id 可跨模块日志文件（retrieval/generation/chat_h
 - contextvars 是协程级隔离的，asyncio 任务创建时会快照当前上下文，
   因此中间件里 set 一次，该请求内的所有 await 链路（含 create_task 衍生的
   历史落库任务、SSE 流式生成器）都能读到同一个 request_id。
-
-Trace/Span（PROJECT_AUDIT §7.2(7)/§7.3）：一个 trace_id + 若干 span 组成一次请求的调用链。
-- trace_id 由中间件按 X-Trace-ID 透传或回退到 request_id 生成，贯穿整条链；
-- span() 上下文管理器产出 span_id/parent_id（按 contextvars 嵌套取父），
-  退出时记录 duration_ms/status，写一条结构化 JSON 日志并进内存环形缓冲，
-  供查询接口按 trace_id 取回。刻意不接 OpenTelemetry：单进程演示定位「刚发生的
-  慢/失败链路」用不着整套 SDK，内存环缓冲 + JSON 日志已够用。
 """
 import contextvars
-import json
 import re
 import time
 import uuid
@@ -167,7 +159,20 @@ def _record_span(trace_id: str, sp: Span) -> None:
     }
     _span_buffer.append(entry)
     from logs.log_config import log          # 延迟导入：log_config 反向依赖本模块
-    log.info("trace_span " + json.dumps(entry, ensure_ascii=False))
+    # 结构化落一条 span.done：trace_id/span_id 显式给出（此时 _span_id 已 reset，
+    # 走上下文会拿到父 span），其余字段由 JSONFormatter 上浮为顶层字段，
+    # 于是可以按 event="span.done" + name + dur_ms 直接聚合（旧版是拼进 message 的嵌套 JSON）。
+    log.info(sp.name, extra={
+        "event": "span.done",
+        "trace_id": trace_id,
+        "span_id": sp.span_id,
+        "parent_id": sp.parent_id or "-",
+        "op": sp.name,
+        "kind": sp.kind,
+        "dur_ms": sp.duration_ms,
+        "status": sp.status,
+        "error": sp.error,
+    })
 
 
 def get_trace_spans(trace_id: str) -> List[Dict[str, Any]]:

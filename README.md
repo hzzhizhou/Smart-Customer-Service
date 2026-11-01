@@ -6,13 +6,21 @@
 - 前端：Vue 3 / Element Plus / Vite
 - 部署：Docker Compose（app / MySQL / Redis / Prometheus / Grafana）
 
+通用大模型直接接客诉有三个绕不过去的坑，本项目的设计基本都围绕这三条：
+
+| 问题 | 表现 | 本项目的做法 |
+| --- | --- | --- |
+| **无依据作答** | 编造退款政策、瞎报价 | RAG 检索 + 绝对相似度门控，低置信直接拒答转人工 |
+| **该查的查不到** | 用户问「我的订单」却在知识库里找 | 意图路由：业务查询走确定性分支，知识问答才走检索 |
+| **会做的事乱做** | 模型自作主张建单、改地址 | 工具身份由服务端注入，写操作走确定性分支 + 幂等键 |
+
 | 指标 | 数值 |
 | --- | --- |
 | HTTP / WebSocket 端点 | 35（32 条路径） |
 | Agent 工具 | 5 |
-| 单元测试 | 363 个全部通过（本机约 23s） |
-| 知识库语料 | 10 个文件（8 篇文档 + 2 份表格） |
-| 评测集 | 意图 81 条 · RAGAS 30 题 · 业务端到端 53 题 |
+| 单元测试 | 379 个全部通过 |
+| 知识库语料 | 12 个文件（PDF 2 · DOCX 6 · XLSX 3 · CSV 1） |
+| 评测集 | 意图 81 条 · RAGAS 30 题 |
 | 并发压测（10 并发 × 40 请求） | P50 40.9s · P95 47.6s · P99 48.4s · 0 失败 |
 
 ## 目录
@@ -38,6 +46,8 @@
 - **混合检索**：BM25 + 向量双路召回，RRF 融合，Cross-Encoder 重排，绝对余弦相似度门控
   （high ≥ 0.80 / low < 0.55），低置信自动转人工。
 - **意图识别**：规则优先 + LLM 兜底，区分「问政策」与「要办理」；规则层直判占比约 75%。
+- **多诉求处理**：一句话里问多件事时按连接词/主题词拆子问，逐子问检索、逐子问门控，
+  答不上的那部分显式说明「没查到」而不是整句拒答；「咨询 + 退货」这类读写混合诉求先答咨询再办业务。
 - **人工会话**：转人工自动建单；WebSocket 下行、HTTP 上行；断线按 `after_id` 增量补消息。
 - **工程化**：单测、Prometheus 指标、请求级 trace、工具调用审计、Grafana 看板、一键编排。
 
@@ -74,6 +84,16 @@
 | 数据层 | `ingestion/` | 文档加载、清洗、分块、向量入库 |
 | 基础设施 | `infrastructure/` | Chroma、MySQL、Redis |
 
+四条关键设计点（理由与实测见 [设计说明](RagServerSystem/docs/design-notes.md)）：
+
+- **门控与重排解耦**：门控只看召回候选集，不看重排后的 TOP-N。否则重排一旦把高分文档挤出前 N，
+  门控会误判 low 而误转人工。
+- **多子问不互相挤占名额**：一次提多个问题时逐子问检索，先剔除「无据可查」的子问，
+  只在能答的子问之间取最弱做门控，并在答复里显式说明哪部分没答。
+- **身份不经过模型**：工具读服务端 ContextVar 注入的 user_id，不从 LLM 填的参数里取，
+  提示注入无法伪造账号。
+- **拒答话术确定性**：不用模型自由发挥，整段替换为固定模板，避免「拒答时又编一句」。
+
 ## 3. 技术栈
 
 | 类别 | 选型 |
@@ -87,7 +107,7 @@
 | 缓存 | Redis：会话历史热缓存，不可用时回源 MySQL（fail-open） |
 | 可观测 | Prometheus 指标、Grafana 看板、请求级 trace、工具调用审计 |
 | 前端 | Vue 3（script setup）、Element Plus、Vue Router、Pinia、Vite |
-| 测试 | pytest（363 个用例） |
+| 测试 | pytest（379 个用例） |
 
 ## 4. 快速开始
 
@@ -277,12 +297,10 @@ AI大模型与智能体开发/
 ```powershell
 cd RagServerSystem
 
-python -m pytest tests -q          # 单测：363 passed
+python -m pytest tests -q          # 单测：379 passed
 python intent_eval.py rule         # 意图规则层评测：81 条，秒级、零 LLM 费用
 python intent_calibration.py       # 置信度校准：可靠性表 + ECE + 阈值扫描
-python verify_dataset.py           # 离线检索命中验证（不带参数不会改数据）
 python e2e_online_test.py          # 在线端到端 S0-S5，需服务在 8000 运行
-python e2e_business_eval.py        # 业务评测集 53 题，需服务在 8000 运行
 python -m evaluation.service       # RAGAS 双臂对比（开 / 关重排），30 题
 python benchmark.py -c 10 -n 40    # 并发压测：/agent/stream 全链路，P50/P95/P99
 ```
@@ -333,7 +351,6 @@ CPU 重排单点（并发下事实串行），LLM 生成（API 并发）被排�
 - **指标**：`GET /metrics` 暴露请求量、延迟、TTFT、检索阶段耗时、工具调用与兜底次数。
 - **看板**：Grafana 数据源与看板由 `deploy/observability` 自动装载。
 - **日志**：按层分文件写入 `logs/Log_server/<layer>/`，每条带 `request_id` 与 `trace_id`；
-  支持按 `trace_id` 查询单次请求的 span 链路。
 - **限流**：按客户端 IP 60 次/分，超限 429。
 - **熔断**：LLM 与 Redis 各自独立熔断，失败 5 次断开、60s 后半开探测，熔断后自动降级。
 - **生产部署**：后端不托管前端产物。用 Nginx 托管 `frontend/dist`，把 `/api` 去前缀反代到后端 8000，并为 WebSocket 开启 upgrade。
@@ -347,9 +364,9 @@ CPU 重排单点（并发下事实串行），LLM 生成（API 并发）被排�
 - 本地模型路径为绝对路径，换机器需修改 `config/settings.py`。
 - CPU 环境下 Cross-Encoder 重排约 4s/题（20 候选真实分块；首次加载 20~25s），可用 `RERANK_MODE=none` 临时关闭。
 - 门控阈值与意图词表依赖评测集持续回归。
-- **单意图路由**：一张图只走一个分支，逗号分隔的多问题不会被拆分，第二个诉求可能被忽略；完整多意图需 plan 节点 + Send 子图 + 结果合并。
+- **一张图仍只走一个业务分支**：多子问已在检索层拆开并分别作答，但「退货 + 投诉」这类
+  **两个写操作**不会自动串行，需用户二次确认；完整多意图需 plan 节点 + Send 子图 + 结果合并。
 - **编排层无 checkpointer**：图为单轮短事务，跨轮状态由 DST / MySQL 承担；引入人工中断或断点恢复时再加。
-- `combined_splitter` 未作默认：当前语料较短，父子分层会退化为重复存储。
 
 完整取舍说明见 [设计说明](RagServerSystem/docs/design-notes.md#8-已知限制与取舍)。
 

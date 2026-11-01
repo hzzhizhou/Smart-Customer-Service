@@ -17,10 +17,13 @@ from shared.constants import (
     MAINLINE_SWITCH_SCORE,
     could_be_empty_answer,
     is_empty_answer,
+    split_sub_questions,
+    looks_like_question,
 )
 from shared.reply_templates import (
     AGENT_NO_ANSWER_FALLBACK,
     KNOWLEDGE_NO_ANSWER,
+    NO_ANSWER_SIGNALS,
     SERVICE_CONTACT,
 )
 from service.handlers import (
@@ -43,6 +46,7 @@ from utils.metrics import (
     intent_total,
 )
 from utils.request_context import get_request_id, get_trace_id, span
+from service.turn.context_resolver import merge_into_slots, resolve_question
 
 from .graph import build_turn_graph, route_turn
 from .state import TurnState, _redact_args, _result_digest, _summarize_value
@@ -83,6 +87,33 @@ class AgentTurnService:
         _spawn_producer(self._produce(turn, stream_q), queue)
         return queue
 
+    # ---------- 多轮补全 ----------
+    @staticmethod
+    def _resolve_multi_turn(question: str, dst, history_msgs) -> str:
+        """补全跨轮实体并把继承到的槽位合并进 DST；返回原问题（不改写）。
+
+        失败不影响主链路：补全只是「让下游少反问一次」，拿不到就照旧走反问。
+        """
+        try:
+            texts = []
+            for m in (history_msgs or []):
+                content = getattr(m, "content", m)
+                if isinstance(content, str) and content.strip():
+                    texts.append(content)
+            res = resolve_question(question, dst=dst, history_texts=texts)
+            if not res.changed:
+                return question
+            log.info("多轮补全", extra={"event": "turn.context.resolve", **res.as_log_fields()})
+            slots = getattr(dst, "slots", None)
+            if isinstance(slots, dict):
+                dst.slots = merge_into_slots(slots, res.inherited)
+            return question
+        except Exception as exc:                     # noqa: BLE001 补全是增强，不能拖垮主链路
+            log.warning("多轮补全失败，按原问题继续",
+                        extra={"event": "turn.context.resolve.error",
+                               "err": f"{type(exc).__name__}: {exc}"})
+            return question
+
     # ---------- 准备阶段 ----------
     async def _prepare(self, question: str, session_id: str,
                        user: Dict[str, Any]) -> TurnState:
@@ -96,6 +127,11 @@ class AgentTurnService:
         messages = self._build_messages(history_msgs, question)
         # DST：加载跨轮会话状态，注入已收集槽位/待补项
         dst = await self.dst_manager.load(session_id) if DST_ENABLED else None
+
+        # 多轮补全：把「那能改地址吗」这类省略句依赖的实体从会话状态/最近历史里补出来。
+        # 只补槽位、不改写原句（下游确定性分支用正则解析原句，加前缀会改变解析结果）。
+        question = self._resolve_multi_turn(question, dst, history_msgs)
+
         return TurnState(
             ctx=TurnContext(
                 retrieval_service=self.retrieval_service,
@@ -242,10 +278,58 @@ class AgentTurnService:
         else:
             intent_info = turn.ctx.intent_info or {}
         branch = route_turn(turn.ctx, state.get("dst_enabled", DST_ENABLED))
+        multi = self._analyze_multi_intent(turn.ctx.question)
         return {
             "intent": intent_info.get("intent", ""),
             "confidence": intent_info.get("confidence", 0.0),
             "branch": branch,
+            **multi,
+        }
+
+    # 只读意图：作答不改变任何业务状态，可以在动作分支之前先答
+    READ_INTENTS = frozenset({"consult", "order_query", "logistics"})
+    # 动作意图：有副作用（建单/退款/改状态），不能与别的动作并行
+    ACTION_INTENTS = frozenset({"return", "refund", "complaint", "ticket"})
+
+    def _analyze_multi_intent(self, question: str) -> dict:
+        """切分子句并判定「多意图」，结果写进 state 供路由与分支复用。
+
+        为什么放在 classify 而不是检索层：动作分支（退货/投诉）根本不走检索，
+        把判定放在检索层等于对这些分支失效——实测「能开专票吗，另外我要退货」
+        只识别到 return，发票那半句被整段丢掉。
+
+        判定「多意图」用的是意图集合去重后的大小，不是子句数量：
+        「保修多久、范围包括屏幕吗」两个子句但同属保修，不该触发多意图处理。
+
+        只读子句只在「同时存在动作意图」时才回传：全是只读的句子走 consult 分支，
+        检索层本来就按子问拆开检索，不需要在这里重复处理。
+        """
+        empty = {"sub_questions": [], "intent_set": [], "read_questions": [],
+                 "is_multi_intent": False}
+        subs = split_sub_questions(question or "")
+        if len(subs) <= 1 or self.intent_classifier is None:
+            return empty
+
+        labels = []
+        for sub in subs:
+            try:
+                scores = self.intent_classifier.rule_scores(sub)
+            except Exception:
+                scores = {}
+            intent = max(scores, key=scores.get) if scores and max(scores.values()) > 0 else ""
+            labels.append(intent)
+
+        intent_set = {i for i in labels if i}
+        if len(intent_set) <= 1:
+            return {**empty, "sub_questions": subs, "intent_set": sorted(intent_set)}
+
+        has_action = any(i in self.ACTION_INTENTS for i in labels)
+        read_questions = [s for s, i in zip(subs, labels) if i in self.READ_INTENTS]
+        return {
+            "sub_questions": subs,
+            "intent_set": sorted(intent_set),
+            "read_questions": read_questions if has_action else [],
+            "is_multi_intent": True,
         }
 
     def _get_turn_graph(self):
@@ -256,6 +340,47 @@ class AgentTurnService:
             self._turn_graph = graph
         return graph
 
+    # 需要用户补槽位的动作分支：进入前先答「只读」子问
+    ACTION_BRANCHES = frozenset({"return_refund", "complaint"})
+
+    async def _answer_read_questions(self, state, questions) -> None:
+        """复用 consult 分支回答只读子问，流式写进同一个队列（用户先看到咨询答案）。
+
+        只改 ctx.question 临时换成子问，其余上下文（会话/用户/DST）不变；
+        finally 里必须还原，否则后续动作分支会用子问去做槽位提取。
+        """
+        turn = state["turn"]
+        queue: asyncio.Queue = state["queue"]
+        final_text: List[str] = state["final_text"]
+        ctx = turn.ctx
+        origin = ctx.question
+        try:
+            ctx.question = "，".join(questions)
+            # 先缓冲再输出：补答若命中「整句拒答」话术，用户会看到一句没头没脑的
+            # "这个问题我暂时没有查到可靠的资料"，再接上动作引导，观感很糟。
+            # 这里换成针对该子问的短说明——它只是补充信息，不该表现得像整轮失败。
+            pieces = [piece async for piece in handle_consult(ctx)]
+            answer = "".join(pieces)
+            # 兜底话术并不总是与常量完全相等（生成层会再拼客服联系方式），
+            # 所以按特征串判断。信号集中定义在 reply_templates.NO_ANSWER_SIGNALS，
+            # 避免这里另写一份字符串、改文案时漏改。
+            if answer.strip() == AGENT_NO_ANSWER_FALLBACK.strip() \
+                    or any(sign in answer for sign in NO_ANSWER_SIGNALS):
+                answer = f"关于「{questions[0]}」，我这边没查到确切的资料，建议转人工确认。"
+            final_text.append(answer)
+            await queue.put(answer)
+            separator = "\n\n"
+            final_text.append(separator)
+            await queue.put(separator)
+            log.info("多意图：动作分支前已补答只读子问", extra={
+                "event": "turn.multi_intent.read_first",
+                "read_questions": questions,
+            })
+        except Exception as exc:                        # 补答失败不能拖垮动作分支
+            log.warning(f"旁路咨询作答失败，跳过：{exc}")
+        finally:
+            ctx.question = origin
+
     async def _run_handler_node(self, state, handler, dst_tool_count: int,
                                 branch: str) -> dict:
         """执行一条确定性分支：流式写队列 → 落历史 → 推进 DST → 审计。"""
@@ -264,6 +389,12 @@ class AgentTurnService:
         final_text: List[str] = state["final_text"]
         # 分支分布指标：回答「请求实际走了哪条链路」
         branch_total.labels(branch).inc()
+        # 多意图「读 + 写」：动作分支前先把只读子问答掉。
+        # 动作回复会让用户去补槽位（"请提供订单号"），咨询一旦压在后面就永久丢失——
+        # 实测「能开专票吗，另外我要退货」只回了退货引导，发票问题整段消失。
+        read_questions = state.get("read_questions") or []
+        if read_questions and branch in self.ACTION_BRANCHES:
+            await self._answer_read_questions(state, read_questions)
         started = time.perf_counter()
         status, error_code = "success", ""
         with span(f"handler.{branch}", kind="internal"):
@@ -329,6 +460,12 @@ class AgentTurnService:
         question = turn.ctx.question
         session_id = turn.ctx.session_id
         pending = ""       # 正文缓冲：空答复前缀押后判定（见 _replace_empty_answer）
+        # 思考过程埋点：每步模型调用的 TTFT / 总耗时 / 产出字数 / 是否决定调工具
+        # tool_idx：本次工具调用的「序号集合」。流式下一个工具会被拆成多个
+        # tool_call_chunks，早期用计数器累加会把 2 个工具记成 9（分片数），
+        # 日志里就变成「模型在乱调工具」。按 index 去重才是真实工具个数。
+        think = {"step": 0, "t0": 0.0, "first": 0.0, "chars": 0,
+                 "tool_idx": set(), "tool_chunks": 0, "reasoning": 0}
         passthrough = False
         tool_calls_this_round = {"n": 0}   # 统计本轮工具调用（推进 EXECUTING 阶段）
         tool_started: Dict[str, tuple] = {}  # run_id → (打点时刻, 入参)：耗时观测 + 审计落库
@@ -353,8 +490,12 @@ class AgentTurnService:
                     tool_calls_this_round["n"] += 1
                     args = (event.get("data") or {}).get("input")
                     tool_started[event.get("run_id", "")] = (time.perf_counter(), args)
-                    log.info(f"Agent 工具调用开始 | 第{tool_calls_this_round['n']}次 | "
-                             f"tool={event.get('name')} | 入参={_summarize_value(args)}")
+                    log.info("工具调用开始", extra={
+                        "event": "agent.tool.start",
+                        "seq": tool_calls_this_round["n"],
+                        "tool": event.get("name"),
+                        "arguments": _summarize_value(args),
+                    })
                     continue
                 if event["event"] == "on_tool_end":
                     tool = event.get("name") or "unknown"
@@ -364,8 +505,12 @@ class AgentTurnService:
                         output = (event.get("data") or {}).get("output")
                         agent_tool_calls_total.labels(tool, "success").inc()
                         agent_tool_duration_seconds.labels(tool).observe(elapsed)
-                        log.info(f"Agent 工具调用完成 | tool={tool} | 耗时={elapsed:.2f}s | "
-                                 f"输出={_summarize_value(output)}")
+                        log.info("工具调用完成", extra={
+                            "event": "agent.tool.done",
+                            "tool": tool, "status": "ok",
+                            "dur_ms": round(elapsed * 1000, 1),
+                            "result": _summarize_value(output),
+                        })
                         # 审计落库（C1）：一次调用一行，入参脱敏、结果只存摘要哈希
                         await self._record_tool_audit(
                             turn, tool, "success", "", int(elapsed * 1000), args, output)
@@ -378,28 +523,66 @@ class AgentTurnService:
                         if started else 0
                     error_code = type(err).__name__ if err is not None else "tool_error"
                     agent_tool_calls_total.labels(tool, "error").inc()
-                    log.warning(f"Agent 工具调用失败 | tool={tool} | "
-                                f"err={_summarize_value(err)}")
+                    log.warning("工具调用失败", extra={
+                        "event": "agent.tool.error", "tool": tool,
+                        "status": "error", "err": _summarize_value(err),
+                        "dur_ms": duration_ms,
+                    })
                     # 审计落库（C1）：失败也留痕（status=error + 异常类名），入参同样脱敏
                     await self._record_tool_audit(
                         turn, tool, "error", error_code, duration_ms,
                         started[1] if started else None)
                     continue
+                # 每步模型调用：开始时清零计数，结束时落一条「思考完成」，
+                # 于是日志里能读出一条思维链：第1步想了 X ms → 决定调 A → 第2步想了 Y ms → 出答案
+                if event["event"] == "on_chat_model_start":
+                    think.update(step=think["step"] + 1, t0=time.perf_counter(),
+                                 first=0.0, chars=0, tool_idx=set(),
+                                 tool_chunks=0, reasoning=0)
+                    continue
+                if event["event"] == "on_chat_model_end":
+                    if think["t0"]:
+                        ended = time.perf_counter()
+                        log.info("思考完成", extra={
+                            "event": "agent.think.done",
+                            "step": think["step"],
+                            "ttft_ms": round(((think["first"] or ended) - think["t0"]) * 1000, 1),
+                            "dur_ms": round((ended - think["t0"]) * 1000, 1),
+                            "chars": think["chars"],
+                            # 只记「思维链有多长」，不记内容：原文可能含用户隐私与
+                            # 内部提示词，体积又是正文数倍，不适合进日志。
+                            "reasoning_chars": think["reasoning"],
+                            "tool_calls": len(think["tool_idx"]),
+                            "tool_chunks": think["tool_chunks"],
+                        })
+                        think["t0"] = 0.0
+                    continue
                 if event["event"] != "on_chat_model_stream":
                     continue
                 chunk = event["data"]["chunk"]
                 msg = getattr(chunk, "message", None) or chunk
+                if think["t0"] and not think["first"]:
+                    think["first"] = time.perf_counter()
                 # 工具调用阶段的结构化块（带 tool_call_chunks）一律跳过：那是工具调用，
                 # 不是面向用户的正文。原生协议下正文与工具调用是两类块，天然可区分。
-                if getattr(msg, "tool_call_chunks", None):
+                _tool_chunks = getattr(msg, "tool_call_chunks", None)
+                if _tool_chunks:
+                    think["tool_chunks"] += 1
+                    for _tc in _tool_chunks:
+                        _idx = _tc.get("index") if isinstance(_tc, dict) else None
+                        if _idx is not None:
+                            think["tool_idx"].add(_idx)
                     continue
                 # 推理模型（如部分 qwen/deepseek 变体）把思维链放在 reasoning_content：
                 # 那是内部推理，绝不能当正文透出。
-                if (getattr(msg, "additional_kwargs", None) or {}).get("reasoning_content"):
+                _reasoning = (getattr(msg, "additional_kwargs", None) or {}).get("reasoning_content")
+                if _reasoning:
+                    think["reasoning"] += len(str(_reasoning))
                     continue
                 content = msg.content if isinstance(msg.content, str) else ""
                 if not content:
                     continue
+                think["chars"] += len(content)
                 # 与 RAG 链路同一处理：正文可能是「无相关信息」这类占位答复，
                 # 先把「可能是空答复」的前缀押后，一旦偏离所有候选写法立即 flush 转直通。
                 if passthrough:
@@ -438,7 +621,17 @@ class AgentTurnService:
         finally:
             # Agent 整体耗时：覆盖本轮 ReAct 全流程（含多轮工具调用）。
             # 缺此观测则「Agent 整体耗时分位」面板恒为空（指标有声明无埋点）。
+            turn_ms = (time.perf_counter() - agent_t0) * 1000
             agent_duration_seconds.observe(time.perf_counter() - agent_t0)
+            # 本轮汇总：一次 ReAct 的步数/工具数/总耗时，排障时看这一行就够
+            log.info("Agent 本轮结束", extra={
+                "event": "agent.turn.done",
+                "steps": think["step"],
+                "tools": tool_calls_this_round["n"],
+                "dur_ms": round(turn_ms, 1),
+                "answer_chars": len("".join(final_text)),
+                "fallback": not bool(final_text),
+            })
             answer = "".join(final_text)
             if answer:
                 await finalize_turn(turn.chat_history, question, answer)

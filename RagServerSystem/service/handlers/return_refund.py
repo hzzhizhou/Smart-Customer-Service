@@ -17,6 +17,7 @@ from shared.reply_templates import (
     RETURN_DUPLICATED,
     RETURN_RECORD_FALLBACK,
     RETURN_SUBMITTED,
+    RETURN_SYSTEM_ERROR,
     SERVICE_CONTACT,
     return_flow_brief,
     stage_cn,
@@ -33,6 +34,24 @@ def _is_confirmation(question: str) -> bool:
 
 CANCEL_HINTS = ("不退货", "不退了", "不想退", "不退款", "算了", "取消", "不用了", "先不办")
 
+_REQUEUE_HINTS = ("退款", "退货", "换货", "办理", "继续", "提交", "还是办")
+
+
+def _is_cancel_request(question: str) -> bool:
+    """判断本句是否为「放弃本次申请」。
+
+    不能只用子串命中：中文里「算了」经常是否定前一个提议、转向新诉求的连接词。
+    规则是——命中取消词后，看它**之后**还有没有新的办理动作；有则视为换动作。
+    """
+    hit = next((k for k in CANCEL_HINTS if k in question), None)
+    if hit is None:
+        return False
+    tail = question.split(hit, 1)[1]
+    if any(k in tail for k in _REQUEUE_HINTS):
+        log.info(f"取消词被新诉求覆盖 | hint={hit} | 问题={question[:40]}")
+        return False
+    return True
+
 
 async def handle_return_refund(ctx: TurnContext) -> AsyncIterator[str]:
     """产出退货/退款引导答复（收集槽位 → 确认 → 登记工单）。"""
@@ -41,8 +60,7 @@ async def handle_return_refund(ctx: TurnContext) -> AsyncIterator[str]:
     except Exception as e:
         log.error(f"退货/退款主流程异常: {e}", exc_info=True)
         # 同样不能空口承诺转接：异常分支没有建单，用户等不到人工接入。
-        yield ("抱歉，办理退货/退款时遇到系统问题，暂时无法确认本次操作的结果。\n"
-               "请稍后重试，或回复“退货进度”核实；如需人工客服协助，直接回复“转人工”。")
+        yield RETURN_SYSTEM_ERROR
 
 
 async def _run_mainline(ctx: TurnContext) -> str:
@@ -57,7 +75,7 @@ async def _run_mainline(ctx: TurnContext) -> str:
     # 取消闸门必须先于一切分支：它不依赖意图分类，也不依赖 DONE 文案，
     # 用户在任何收集/确认阶段说"不办了"都能立刻退出主线。
     if dst.stage in (Stage.COLLECTING, Stage.CONFIRMING) \
-            and any(k in ctx.question for k in CANCEL_HINTS):
+            and _is_cancel_request(ctx.question):
         dst.intent, dst.stage, dst.slots = "chat", Stage.COLLECTING, {}
         await ctx.dst_manager.save(dst)
         log.info(f"退货/退款取消 | session={ctx.session_id} | 问题={ctx.question[:40]}")
@@ -135,7 +153,10 @@ async def _run_mainline(ctx: TurnContext) -> str:
             # 用户一开始就能看懂接下来会发生什么、自己需要做什么。
             _stage = _ticket.get("stage", "")
             _sdef = stage_def(_stage)
-            _step, _total = stage_step(_stage, _category)
+            # 订单状态决定走哪套流程：已付款未发货=拦截退款（4 步，无寄回），
+            # 已发货未签收=拒收退回（6 步），已签收=寄回验收（6 步）。
+            _order_status = (_check.get("status_raw") or "")
+            _step, _total = stage_step(_stage, _category, _order_status)
             resp = RETURN_SUBMITTED.format(
                 subject=subject,
                 ticket_id=_ticket["ticket_id"],
@@ -144,7 +165,7 @@ async def _run_mainline(ctx: TurnContext) -> str:
                 step=_step,
                 total=_total,
                 stage_cn=stage_cn(_stage),
-                flow=return_flow_brief(_category),
+                flow=return_flow_brief(_category, _order_status),
                 next=_sdef["next"],
                 sla=_sdef["sla"],
                 contact=SERVICE_CONTACT,

@@ -15,7 +15,9 @@ from config.settings import (
     LLM_MODEL, LLM_TEMPERATURE,
     LLM_API_KEY, LLM_BASE_URL, LLM_TIMEOUT,
     LLM_FALLBACK_MODEL, LLM_FALLBACK_BASE_URL, LLM_FALLBACK_API_KEY,
+    LLM_PRICE_IN_PER_1K, LLM_PRICE_OUT_PER_1K,
 )
+from logs.log_config import log
 from utils.metrics import (
     llm_requests_total, llm_tokens_total,
     llm_request_duration_seconds, llm_ttft_seconds,
@@ -83,6 +85,20 @@ class LLMMetricsCallback(BaseCallbackHandler):
         prompt_tokens, completion_tokens = self._usage(response, state)
         llm_tokens_total.labels(model, "prompt").inc(prompt_tokens)
         llm_tokens_total.labels(model, "completion").inc(completion_tokens)
+        # 单次调用成本进日志：Prometheus 只有全局累加值，回溯不到「这一轮对话花了多少」，
+        fields = {
+            "event": "llm.usage",
+            "model": model,
+            "tokens_in": prompt_tokens,
+            "tokens_out": completion_tokens,
+            "ttft_ms": round(max((state.first_token_at - state.started) * 1000, 0.0), 1)
+            if state and state.first_token_at else None,
+            "dur_ms": round(self._elapsed(state) * 1000, 1),
+        }
+        cost = self._cost(prompt_tokens, completion_tokens)
+        if cost is not None:
+            fields["cost"] = round(cost, 6)
+        log.info("模型调用完成", extra=fields)
 
     def on_llm_error(self, error, *, run_id=None, **kwargs):
         state = self._runs.pop(str(run_id or ""), None)
@@ -118,6 +134,14 @@ class LLMMetricsCallback(BaseCallbackHandler):
                 completion_chars += len(getattr(gen, "text", "") or "")
         prompt_chars = state.prompt_chars if state is not None else 0
         return self._estimate(prompt_chars), self._estimate(completion_chars)
+
+    @staticmethod
+    def _cost(prompt_tokens: int, completion_tokens: int) -> Optional[float]:
+        """按「元 / 千 token」折算单次调用成本；单价未配置时返回 None。"""
+        if LLM_PRICE_IN_PER_1K is None and LLM_PRICE_OUT_PER_1K is None:
+            return None
+        return ((prompt_tokens or 0) / 1000.0 * (LLM_PRICE_IN_PER_1K or 0.0)
+                + (completion_tokens or 0) / 1000.0 * (LLM_PRICE_OUT_PER_1K or 0.0))
 
     @staticmethod
     def _estimate(chars: int) -> int:

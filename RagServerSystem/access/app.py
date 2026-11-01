@@ -20,7 +20,9 @@ import uvicorn
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
-from config.settings import API_HOST, API_PORT, RESPONSE_TIMEOUT, ENABLE_API_DOCS
+from config.settings import (
+    API_HOST, API_PORT, RESPONSE_TIMEOUT, ENABLE_API_DOCS,
+)
 from logs.log_config import log
 from agent.service import create_unified_agent
 from utils.llm_factory import create_llm
